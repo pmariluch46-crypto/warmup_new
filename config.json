@@ -1,0 +1,15 @@
+{
+  "firefox_binary": "O:\\FirefoxPortable\\App\\Firefox64\\firefox.exe",
+  "firefox_profile": "O:\\FirefoxPortable\\Data\\profile",
+  "geckodriver_path": "Q:\\Warmer\\WarmUpPro\\core\\geckodriver.exe",
+
+  "read_speed": 0.7,
+  "min_session_gap_minutes": 1,
+
+  "browse1_minutes": 15,
+  "idle_minutes": 8,
+  "browse2_minutes": 20,
+
+  "window_width": 1200,
+  "window_height": 800
+}
