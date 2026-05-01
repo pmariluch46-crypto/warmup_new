@@ -1,854 +1,531 @@
-"""
-ui/tab_amazon.py  --  Amazon Warmer tab (Google Ads Editor style, 3 columns).
-
-Left   : Active categories (checkboxes) + Firefox status
-Middle : Session settings + progress + Start/Stop
-Right  : Full query editor (20 categories × 100 queries)
-"""
-
-import time
 import threading
-import tkinter as tk
-from tkinter import messagebox
-import customtkinter as ctk
-
-from core import geckodriver_util
-from core.amazon_query_manager import (
-    load_amazon_queries, get_amazon_categories,
-    add_amazon_query, remove_amazon_query, update_amazon_query,
+import json
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QScrollArea, QFrame, QProgressBar,
+    QListWidget, QListWidgetItem, QTextEdit, QSplitter
 )
-from core.i18n import t
-from core import history
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
 
-# Цвета — близко к Material 3, но с сохранением логики старого UI
-CT_BG       = "#0b0f19"   # общий фон вкладки (тёмный)
-CARD_BG     = "#111827"   # карточки
-BORDER      = "#1f2933"
-TEXT_MAIN   = "#e5e7eb"
-TEXT_SUB    = "#9ca3af"
-ACCENT      = "#3b82f6"
-SUCCESS     = "#22c55e"
-ERROR       = "#ef4444"
-WARNING     = "#f59e0b"
-AMZN        = "#FF9900"
-AMZN_DARK   = "#e68900"
-ROW_ALT     = "#020617"
+from ui.styles import (
+    page_title, card, section_title, sub_label,
+    styled_slider, styled_checkbox, primary_btn, danger_btn,
+    success_btn, secondary_btn, scroll_wrap,
+    BG_PAGE, ACCENT, ACCENT2, TEXT_SUB, TEXT_MAIN, BORDER
+)
 
-_ALL_CATEGORIES = [
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+
+
+AMAZON_CATEGORIES = [
     "Electronics", "Computers & Laptops", "Cell Phones & Accessories",
     "Home & Kitchen", "Clothing & Fashion", "Sports & Outdoors",
     "Books", "Toys & Games", "Beauty & Personal Care",
     "Health & Household", "Automotive", "Garden & Outdoor",
     "Pet Supplies", "Office Products", "Tools & Home Improvement",
     "Baby Products", "Food & Grocery", "Video Games & Consoles",
-    "Movies & TV Shows", "Musical Instruments", "Own Requests",
+    "Movies & TV Shows", "Musical Instruments",
 ]
 
 
-class AmazonTab(ctk.CTkFrame):
-    def __init__(self, parent, app):
-        super().__init__(parent, fg_color="transparent", corner_radius=0)
-        self.app = app
-        self._stop_event   = threading.Event()
-        self._thread       = None
-        self._session_start = None
-        self._timer_job    = None
-        self._editor_cat   = None
-        self._editor_idx   = None
-        self._build()
+class AmazonTab(QWidget):
+    _sig_progress = pyqtSignal(str, int)
+    _sig_status   = pyqtSignal(str, str)
 
-    # ==========================================================================
-    #  BUILD (3‑колоночный layout)
-    # ==========================================================================
+    def __init__(self, settings, main_window):
+        super().__init__()
+        self.settings    = settings
+        self.main_window = main_window
+        self._stop_event = None
+        self._queries    = {}
+        self._current_cat = None
 
-    def _build(self):
-        # Общий layout: заголовок + 3 колонки
-        self.grid_columnconfigure(0, weight=0)   # left
-        self.grid_columnconfigure(1, weight=0)   # middle
-        self.grid_columnconfigure(2, weight=1)   # right
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=1)
+        self._sig_progress.connect(self._on_progress)
+        self._sig_status.connect(self._on_status)
 
-        # Header
-        hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.grid(row=0, column=0, columnspan=3, sticky="ew", padx=24, pady=(16, 0))
-        ctk.CTkLabel(
-            hdr,
-            text=t('amazon_title'),
-            font=("Segoe UI Variable", 20, "bold"),
-            text_color=TEXT_MAIN
-        ).pack(side="left")
-        ctk.CTkLabel(
-            hdr,
-            text=t('amazon_sub'),
-            font=("Segoe UI Variable", 12),
-            text_color=TEXT_SUB
-        ).pack(side="left", padx=12)
+        self.setStyleSheet(f"background: {BG_PAGE};")
+        self._load_queries()
+        self._build_ui()
 
-        # ЛЕВАЯ КОЛОНКА: Firefox status + Active Categories
-        left = ctk.CTkScrollableFrame(
-            self, fg_color=CT_BG, corner_radius=0, width=260
-        )
-        left.grid(row=1, column=0, sticky="nsw", padx=(16, 8), pady=(8, 16))
-        left.grid_columnconfigure(0, weight=1)
+    def _load_queries(self):
+        path = DATA_DIR / "amazon_queries.json"
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._queries = json.load(f)
+            except Exception:
+                self._queries = {}
 
-        # СРЕДНЯЯ КОЛОНКА: Session settings + Progress + Start/Stop
-        middle = ctk.CTkScrollableFrame(
-            self, fg_color=CT_BG, corner_radius=0, width=260
-        )
-        middle.grid(row=1, column=1, sticky="nsw", padx=(0, 8), pady=(8, 16))
-        middle.grid_columnconfigure(0, weight=1)
+    def _save_queries(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / "amazon_queries.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._queries, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Save Error", str(e))
 
-        # ПРАВАЯ КОЛОНКА: Query Editor (категории + список + редактирование)
-        right = ctk.CTkFrame(self, fg_color=CT_BG, corner_radius=0)
-        right.grid(row=1, column=2, sticky="nsew", padx=(0, 16), pady=(8, 16))
-        right.grid_columnconfigure(0, weight=0)
-        right.grid_columnconfigure(1, weight=1)
-        right.grid_rowconfigure(0, weight=0)
-        right.grid_rowconfigure(1, weight=1)
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setSpacing(16)
 
-        self._build_left(left)
-        self._build_middle(middle)
-        self._build_right(right)
+        # ── Title row ─────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_lbl = page_title("Amazon Warmer")
+        title_row.addWidget(title_lbl)
+        info = QLabel("amazon.com  •  no login required")
+        info.setFont(QFont("Segoe UI", 9))
+        info.setStyleSheet(f"color: {TEXT_SUB};")
+        title_row.addWidget(info)
+        title_row.addStretch()
+        self.firefox_label = QLabel("")
+        self.firefox_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        title_row.addWidget(self.firefox_label)
+        outer.addLayout(title_row)
 
-    # --------------------------------------------------------------------------
-    #  LEFT COLUMN: Firefox status + Active Categories
-    # --------------------------------------------------------------------------
+        # ── Main splitter: left config | right query editor ────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("QSplitter::handle { background: #e0e5f0; width: 1px; }")
 
-    def _build_left(self, parent):
-        # Firefox status
-        path_card = self._card(parent, row=0, title=t('ff_config'))
-        self._ff_lbl = ctk.CTkLabel(
-            path_card,
-            text=t('checking_paths'),
-            font=("Segoe UI Variable", 12),
-            text_color=TEXT_SUB
-        )
-        self._ff_lbl.pack(anchor="w", padx=16, pady=(4, 12))
+        # Left panel
+        left_widget = QWidget()
+        left_widget.setStyleSheet(f"background: {BG_PAGE};")
+        left_vbox = QVBoxLayout(left_widget)
+        left_vbox.setContentsMargins(0, 0, 8, 0)
+        left_vbox.setSpacing(12)
 
-        # Categories
-        cat_card = self._card(parent, row=1, title=t('active_categories'))
-        ctrl = ctk.CTkFrame(cat_card, fg_color="transparent")
-        ctrl.pack(fill="x", padx=16, pady=(2, 6))
-        ctk.CTkButton(
-            ctrl,
-            text=t('all'),
-            width=54,
-            height=24,
-            font=("Segoe UI Variable", 11),
-            fg_color=AMZN,
-            hover_color=AMZN_DARK,
-            text_color="#000000",
-            command=self._select_all
-        ).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(
-            ctrl,
-            text=t('none'),
-            width=54,
-            height=24,
-            font=("Segoe UI Variable", 11),
-            fg_color=TEXT_SUB,
-            hover_color="#475569",
-            command=self._deselect_all
-        ).pack(side="left")
-
-        grid = ctk.CTkFrame(cat_card, fg_color="transparent")
-        grid.pack(fill="x", padx=16, pady=(0, 10))
-        grid.grid_columnconfigure((0, 1), weight=1)
-
-        self._cat_vars: dict[str, tk.BooleanVar] = {}
-        saved = self.app.settings.get("amazon_categories", _ALL_CATEGORIES[:5])
-        regular_cats = [c for c in _ALL_CATEGORIES if c != "Own Requests"]
-        for i, cat in enumerate(regular_cats):
-            var = tk.BooleanVar(value=(cat in saved))
-            cb = ctk.CTkCheckBox(
-                grid,
-                text=cat,
-                variable=var,
-                font=("Segoe UI Variable", 11),
-                text_color=TEXT_MAIN,
-                checkmark_color="#000000",
-                fg_color=AMZN,
-                hover_color=AMZN_DARK,
-                command=self._save_categories
-            )
-            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=2)
-            self._cat_vars[cat] = var
-
-        # Own Requests — отдельной строкой
-        sep_row = len(regular_cats) // 2 + (1 if len(regular_cats) % 2 else 0)
-        ctk.CTkFrame(grid, height=1, fg_color=BORDER).grid(
-            row=sep_row, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 4)
-        )
-        own_var = tk.BooleanVar(value=("Own Requests" in saved))
-        own_cb = ctk.CTkCheckBox(
-            grid,
-            text="⭐  Own Requests",
-            variable=own_var,
-            font=("Segoe UI Variable", 12, "bold"),
-            text_color=AMZN,
-            checkmark_color="#000000",
-            fg_color=AMZN,
-            hover_color=AMZN_DARK,
-            command=self._save_categories
-        )
-        own_cb.grid(
-            row=sep_row + 1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            padx=6,
-            pady=(0, 6)
-        )
-        self._cat_vars["Own Requests"] = own_var
-
-    # --------------------------------------------------------------------------
-    #  MIDDLE COLUMN: Session settings + Progress + Start/Stop
-    # --------------------------------------------------------------------------
-
-    def _build_middle(self, parent):
-        # Session settings
-        cfg_card = self._card(parent, row=0, title=t('session_settings'))
-        self._minutes_var = tk.IntVar(
-            value=self.app.settings.get("amazon_minutes", 10)
-        )
-        self._add_slider(
-            cfg_card,
-            t('session_duration'),
-            self._minutes_var,
-            3,
-            60,
-            lambda v: self._save_setting("amazon_minutes", v),
-        )
-
-        rev_row = ctk.CTkFrame(cfg_card, fg_color="transparent")
-        rev_row.pack(fill="x", padx=16, pady=(0, 12))
-        self._reviews_var = tk.BooleanVar(
-            value=self.app.settings.get("amazon_read_reviews", True)
-        )
-        ctk.CTkCheckBox(
-            rev_row,
-            text=t('read_reviews'),
-            variable=self._reviews_var,
-            font=("Segoe UI Variable", 12),
-            text_color=TEXT_MAIN,
-            checkmark_color="#000000",
-            fg_color=AMZN,
-            hover_color=AMZN_DARK,
-            command=lambda: self._save_setting(
-                "amazon_read_reviews", self._reviews_var.get()
-            ),
-        ).pack(side="left")
-
-        # Progress
-        prog_card = self._card(parent, row=1, title=t('progress'))
-        self._phase_lbl = ctk.CTkLabel(
-            prog_card,
-            text="—",
-            font=("Segoe UI Variable", 12),
-            text_color=TEXT_SUB
-        )
-        self._phase_lbl.pack(anchor="w", padx=16, pady=(4, 6))
-        self._progress_bar = ctk.CTkProgressBar(
-            prog_card,
-            height=10,
-            fg_color=BORDER,
-            progress_color=AMZN
-        )
-        self._progress_bar.pack(fill="x", padx=16, pady=(0, 4))
-        self._progress_bar.set(0)
-        self._elapsed_lbl = ctk.CTkLabel(
-            prog_card,
-            text=t('elapsed_prefix') + '0:00',
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_SUB
-        )
-        self._elapsed_lbl.pack(anchor="w", padx=16, pady=(0, 10))
+        left_vbox.addWidget(self._build_categories_card())
+        left_vbox.addWidget(self._build_session_card())
+        left_vbox.addWidget(self._build_progress_card())
+        left_vbox.addStretch()
 
         # Buttons
-        btn_card = ctk.CTkFrame(
-            parent,
-            fg_color=CARD_BG,
-            corner_radius=10,
-            border_width=1,
-            border_color=BORDER
+        btn_row = QHBoxLayout()
+        self.btn_start = success_btn("Start Amazon Session")
+        self.btn_start.clicked.connect(self._start)
+        self.btn_stop = danger_btn("Stop")
+        self.btn_stop.setFixedWidth(90)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        btn_row.addWidget(self.btn_start)
+        btn_row.addWidget(self.btn_stop)
+        btn_row.addStretch()
+        left_vbox.addLayout(btn_row)
+
+        splitter.addWidget(left_widget)
+
+        # Right panel — Query Editor
+        right_widget = QWidget()
+        right_widget.setStyleSheet(f"background: {BG_PAGE};")
+        right_vbox = QVBoxLayout(right_widget)
+        right_vbox.setContentsMargins(8, 0, 0, 0)
+        right_vbox.setSpacing(12)
+        right_vbox.addWidget(self._build_query_editor())
+        splitter.addWidget(right_widget)
+
+        splitter.setSizes([420, 580])
+        outer.addWidget(splitter, 1)
+
+        self._check_firefox()
+
+    def _build_categories_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        lay.addWidget(section_title("Active Categories"))
+
+        # All / None buttons
+        btn_row = QHBoxLayout()
+        btn_all = secondary_btn("All")
+        btn_all.setFixedWidth(60)
+        btn_all.clicked.connect(lambda: self._set_all_cats(True))
+        btn_none = secondary_btn("None")
+        btn_none.setFixedWidth(60)
+        btn_none.clicked.connect(lambda: self._set_all_cats(False))
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        # Grid of checkboxes — 2 columns
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        self._cat_checks = {}
+        for i, cat in enumerate(AMAZON_CATEGORIES):
+            cb = styled_checkbox(cat, ACCENT2)
+            self._cat_checks[cat] = cb
+            grid.addWidget(cb, i // 2, i % 2)
+
+        # Own Requests special checkbox
+        self._own_requests_cb = styled_checkbox("⭐ Own Requests", ACCENT2)
+        self._own_requests_cb.setStyleSheet(
+            self._own_requests_cb.styleSheet() +
+            f" QCheckBox {{ color: {ACCENT2}; font-weight: bold; }}"
         )
-        btn_card.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
-        btn_inner = ctk.CTkFrame(btn_card, fg_color="transparent")
-        btn_inner.pack(fill="x", padx=16, pady=12)
+        grid.addWidget(self._own_requests_cb,
+                       len(AMAZON_CATEGORIES) // 2 + 1, 0, 1, 2)
 
-        self._start_btn = ctk.CTkButton(
-            btn_inner,
-            text=t('start_amazon'),
-            height=40,
-            font=("Segoe UI Variable", 13, "bold"),
-            fg_color=SUCCESS,
-            hover_color="#16a34a",
-            command=self._start_session
-        )
-        self._start_btn.pack(fill="x", pady=(0, 6))
+        lay.addLayout(grid)
+        return c
 
-        self._stop_btn = ctk.CTkButton(
-            btn_inner,
-            text=t('stop_amazon'),
-            height=36,
-            font=("Segoe UI Variable", 13, "bold"),
-            fg_color=ERROR,
-            hover_color="#dc2626",
-            state="disabled",
-            command=self._stop_session
-        )
-        self._stop_btn.pack(fill="x")
+    def _build_session_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        lay.addWidget(section_title("Session Settings"))
 
-        self._result_lbl = ctk.CTkLabel(
-            btn_inner,
-            text="",
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_SUB
-        )
-        self._result_lbl.pack(anchor="w", pady=(6, 0))
+        # Duration slider
+        row = QHBoxLayout()
+        lbl = QLabel("Session duration (minutes)")
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        row.addWidget(lbl)
+        self.sl_duration = styled_slider(5, 120, 30, ACCENT2)
+        self.val_duration = QLabel("30")
+        self.val_duration.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.val_duration.setStyleSheet(f"color: {ACCENT2}; min-width: 28px;")
+        self.sl_duration.valueChanged.connect(
+            lambda v: self.val_duration.setText(str(v)))
+        row.addWidget(self.sl_duration, 1)
+        row.addWidget(self.val_duration)
+        lay.addLayout(row)
 
-    # --------------------------------------------------------------------------
-    #  RIGHT COLUMN: Query Editor (категории + список + редактирование)
-    # --------------------------------------------------------------------------
+        self.cb_reviews = styled_checkbox("Read product reviews", ACCENT2)
+        self.cb_reviews.setChecked(True)
+        lay.addWidget(self.cb_reviews)
+        return c
 
-    def _build_right(self, right):
-        sub_hdr = ctk.CTkFrame(right, fg_color="transparent")
-        sub_hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 6))
-        ctk.CTkLabel(
-            sub_hdr,
-            text=t('query_editor'),
-            font=("Segoe UI Variable", 14, "bold"),
-            text_color=TEXT_MAIN
-        ).pack(side="left")
-        ctk.CTkLabel(
-            sub_hdr,
-            text=t('query_editor_hint'),
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_SUB
-        ).pack(side="left", padx=10)
+    def _build_progress_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(8)
+        lay.addWidget(section_title("Progress"))
 
-        # Category list (left pane of editor)
-        cat_frame = ctk.CTkFrame(
-            right,
-            fg_color=CARD_BG,
-            corner_radius=10,
-            border_width=1,
-            border_color=BORDER,
-            width=190
-        )
-        cat_frame.grid(row=1, column=0, sticky="nsew", padx=(16, 6), pady=(0, 16))
-        cat_frame.grid_propagate(False)
-        cat_frame.grid_rowconfigure(1, weight=1)
-        cat_frame.grid_columnconfigure(0, weight=1)
+        self.progress_label = QLabel("—")
+        self.progress_label.setFont(QFont("Segoe UI", 9))
+        self.progress_label.setStyleSheet(f"color: {TEXT_SUB};")
+        lay.addWidget(self.progress_label)
 
-        ctk.CTkLabel(
-            cat_frame,
-            text=t('categories'),
-            font=("Segoe UI Variable", 12, "bold"),
-            text_color=TEXT_MAIN
-        ).grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
-        ctk.CTkFrame(cat_frame, height=1, fg_color=BORDER).grid(
-            row=0, column=0, sticky="sew", padx=8
-        )
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{ background: #e0e5f0; border-radius: 4px; border: none; }}
+            QProgressBar::chunk {{ background: {ACCENT2}; border-radius: 4px; }}
+        """)
+        lay.addWidget(self.progress_bar)
 
-        cat_scroll = ctk.CTkScrollableFrame(
-            cat_frame, fg_color="transparent", corner_radius=0
-        )
-        cat_scroll.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self.elapsed_label = QLabel("Elapsed: 0:00")
+        self.elapsed_label.setFont(QFont("Segoe UI", 9))
+        self.elapsed_label.setStyleSheet(f"color: {TEXT_SUB};")
+        lay.addWidget(self.elapsed_label)
+        return c
 
-        self._cat_btn_map: dict[str, ctk.CTkButton] = {}
-        for cat in _ALL_CATEGORIES:
-            if cat == "Own Requests":
-                ctk.CTkFrame(cat_scroll, height=1, fg_color=BORDER).pack(
-                    fill="x", padx=4, pady=(6, 4)
-                )
-                btn = ctk.CTkButton(
-                    cat_scroll,
-                    text="⭐  Own Requests",
-                    anchor="w",
-                    font=("Segoe UI Variable", 11, "bold"),
-                    height=32,
-                    fg_color="#1f2937",
-                    text_color=AMZN,
-                    hover_color="#111827",
-                    corner_radius=6,
-                    border_width=1,
-                    border_color=AMZN,
-                    command=lambda c=cat: self._select_editor_cat(c),
-                )
-            else:
-                btn = ctk.CTkButton(
-                    cat_scroll,
-                    text=cat,
-                    anchor="w",
-                    font=("Segoe UI Variable", 11),
-                    height=30,
-                    fg_color="transparent",
-                    text_color=TEXT_MAIN,
-                    hover_color=BORDER,
-                    corner_radius=6,
-                    command=lambda c=cat: self._select_editor_cat(c),
-                )
-            btn.pack(fill="x", padx=4, pady=1)
-            self._cat_btn_map[cat] = btn
+    def _build_query_editor(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
 
-        # Query list (right pane of editor)
-        q_frame = ctk.CTkFrame(
-            right,
-            fg_color=CARD_BG,
-            corner_radius=10,
-            border_width=1,
-            border_color=BORDER
-        )
-        q_frame.grid(row=1, column=1, sticky="nsew", padx=(0, 16), pady=(0, 16))
-        q_frame.grid_rowconfigure(1, weight=1)
-        q_frame.grid_columnconfigure(0, weight=1)
+        # Header
+        hdr = QHBoxLayout()
+        hdr.addWidget(section_title("Query Editor"))
+        hint = QLabel("Click a category to view/edit its queries")
+        hint.setFont(QFont("Segoe UI", 8))
+        hint.setStyleSheet(f"color: {TEXT_SUB};")
+        hdr.addWidget(hint)
+        hdr.addStretch()
 
-        tb = ctk.CTkFrame(q_frame, fg_color="transparent")
-        tb.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        self._q_title = ctk.CTkLabel(
-            tb,
-            text=t('select_cat_arrow'),
-            font=("Segoe UI Variable", 13, "bold"),
-            text_color=TEXT_MAIN
-        )
-        self._q_title.pack(side="left")
-        self._q_count = ctk.CTkLabel(
-            tb,
-            text="",
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_SUB
-        )
-        self._q_count.pack(side="left", padx=8)
+        # Action buttons
+        self.btn_save_q = secondary_btn("Save")
+        self.btn_save_q.setFixedWidth(70)
+        self.btn_save_q.clicked.connect(self._save_current_queries)
 
-        ctk.CTkButton(
-            tb,
-            text=t('add'),
-            width=68,
-            height=27,
-            font=("Segoe UI Variable", 11),
-            fg_color=SUCCESS,
-            hover_color="#16a34a",
-            command=self._add_query
-        ).pack(side="right", padx=(4, 0))
-        ctk.CTkButton(
-            tb,
-            text=t('delete'),
-            width=68,
-            height=27,
-            font=("Segoe UI Variable", 11),
-            fg_color=ERROR,
-            hover_color="#dc2626",
-            command=self._delete_query
-        ).pack(side="right", padx=4)
-        ctk.CTkButton(
-            tb,
-            text=t('save'),
-            width=68,
-            height=27,
-            font=("Segoe UI Variable", 11),
-            fg_color=AMZN,
-            hover_color=AMZN_DARK,
-            text_color="#000000",
-            command=self._save_edit
-        ).pack(side="right")
+        self.btn_delete_q = danger_btn("Delete")
+        self.btn_delete_q.setFixedWidth(80)
+        self.btn_delete_q.clicked.connect(self._delete_selected_query)
 
-        ctk.CTkFrame(q_frame, height=1, fg_color=BORDER).grid(
-            row=0, column=0, sticky="sew", padx=8
-        )
+        self.btn_add_q = primary_btn("+ Add")
+        self.btn_add_q.setFixedWidth(80)
+        self.btn_add_q.clicked.connect(self._add_query)
 
-        lb_frame = ctk.CTkFrame(q_frame, fg_color="transparent")
-        lb_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 0))
-        lb_frame.grid_rowconfigure(0, weight=1)
-        lb_frame.grid_columnconfigure(0, weight=1)
+        hdr.addWidget(self.btn_save_q)
+        hdr.addWidget(self.btn_delete_q)
+        hdr.addWidget(self.btn_add_q)
+        lay.addLayout(hdr)
 
-        self._listbox = tk.Listbox(
-            lb_frame,
-            font=("Segoe UI Variable", 11),
-            bg=CARD_BG,
-            fg=TEXT_MAIN,
-            selectbackground=AMZN,
-            selectforeground="#000000",
-            bd=0,
-            highlightthickness=0,
-            activestyle="none",
-            relief="flat",
-        )
-        self._listbox.grid(row=0, column=0, sticky="nsew")
-        sb = tk.Scrollbar(lb_frame, orient="vertical", command=self._listbox.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self._listbox.configure(yscrollcommand=sb.set)
-        self._listbox.bind("<<ListboxSelect>>", self._on_list_select)
+        # Main area: categories list | queries list
+        split = QHBoxLayout()
+        split.setSpacing(12)
 
-        edit_frame = ctk.CTkFrame(q_frame, fg_color="transparent")
-        edit_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=8)
-        edit_frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            edit_frame,
-            text=t('edit_selected_q'),
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_SUB
-        ).grid(row=0, column=0, sticky="w")
-        self._edit_var = tk.StringVar()
-        self._edit_entry = ctk.CTkEntry(
-            edit_frame,
-            textvariable=self._edit_var,
-            height=32,
-            font=("Segoe UI Variable", 12),
-            fg_color=CT_BG,
-            border_color=BORDER,
-            text_color=TEXT_MAIN,
-            placeholder_text=t('query_placeholder'),
-        )
-        self._edit_entry.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        self._edit_entry.bind("<Return>", lambda e: self._save_edit())
+        # Categories list
+        cat_frame = QFrame()
+        cat_frame.setStyleSheet(f"""
+            QFrame {{
+                background: #f8f9fc;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+            }}
+        """)
+        cat_vbox = QVBoxLayout(cat_frame)
+        cat_vbox.setContentsMargins(0, 0, 0, 0)
+        cat_hdr = QLabel("Categories")
+        cat_hdr.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        cat_hdr.setStyleSheet(f"color: {TEXT_SUB}; padding: 8px 12px 4px 12px;")
+        cat_vbox.addWidget(cat_hdr)
 
-    # ==========================================================================
-    #  HELPERS
-    # ==========================================================================
+        self.cat_list = QListWidget()
+        self.cat_list.setStyleSheet(f"""
+            QListWidget {{
+                border: none;
+                background: transparent;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+            }}
+            QListWidget::item {{
+                padding: 6px 12px;
+                color: {TEXT_MAIN};
+                border-radius: 4px;
+            }}
+            QListWidget::item:selected {{
+                background: {ACCENT2};
+                color: white;
+            }}
+            QListWidget::item:hover:!selected {{
+                background: #f0f2f8;
+            }}
+        """)
+        for cat in AMAZON_CATEGORIES:
+            self.cat_list.addItem(cat)
+        own = QListWidgetItem("⭐ Own Requests")
+        own.setForeground(__import__('PyQt6.QtGui', fromlist=['QColor']).QColor(ACCENT2))
+        self.cat_list.addItem(own)
+        self.cat_list.currentRowChanged.connect(self._on_cat_selected)
+        cat_vbox.addWidget(self.cat_list)
+        split.addWidget(cat_frame, 2)
 
-    def _card(self, parent, row, title):
-        frame = ctk.CTkFrame(
-            parent,
-            fg_color=CARD_BG,
-            corner_radius=10,
-            border_width=1,
-            border_color=BORDER
-        )
-        frame.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 12))
-        ctk.CTkLabel(
-            frame,
-            text=title,
-            font=("Segoe UI Variable", 12, "bold"),
-            text_color=TEXT_MAIN
-        ).pack(anchor="w", padx=16, pady=(10, 3))
-        ctk.CTkFrame(frame, height=1, fg_color=BORDER).pack(
-            fill="x", padx=16, pady=(0, 6)
-        )
-        return frame
+        # Queries list + edit
+        q_frame = QFrame()
+        q_frame.setStyleSheet(f"""
+            QFrame {{
+                background: #f8f9fc;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+            }}
+        """)
+        q_vbox = QVBoxLayout(q_frame)
+        q_vbox.setContentsMargins(0, 0, 0, 0)
 
-    def _add_slider(self, parent, label, var, lo, hi, cmd):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(0, 10))
-        ctk.CTkLabel(
-            row,
-            text=label,
-            font=("Segoe UI Variable", 11),
-            text_color=TEXT_MAIN,
-            width=200,
-            anchor="w",
-        ).pack(side="left")
-        val_lbl = ctk.CTkLabel(
-            row,
-            text=str(var.get()),
-            font=("Segoe UI Variable", 11, "bold"),
-            text_color=AMZN,
-            width=28,
-        )
-        val_lbl.pack(side="right")
-        slider = ctk.CTkSlider(
-            row,
-            from_=lo,
-            to=hi,
-            variable=var,
-            number_of_steps=hi - lo,
-            fg_color=BORDER,
-            progress_color=AMZN,
-            button_color=AMZN,
-            button_hover_color=AMZN_DARK,
-            command=lambda v, lbl=val_lbl, fn=cmd: (
-                lbl.configure(text=str(int(v))), fn(int(v))
-            ),
-        )
-        slider.pack(side="right", padx=(0, 8), fill="x", expand=True)
+        self.query_header = QLabel("← Select a category")
+        self.query_header.setFont(QFont("Segoe UI", 9))
+        self.query_header.setStyleSheet(
+            f"color: {TEXT_SUB}; padding: 8px 12px 4px 12px;")
+        q_vbox.addWidget(self.query_header)
 
-    # ==========================================================================
-    #  QUERY CRUD
-    # ==========================================================================
+        self.query_list = QListWidget()
+        self.query_list.setStyleSheet(f"""
+            QListWidget {{
+                border: none;
+                background: transparent;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+            }}
+            QListWidget::item {{
+                padding: 5px 12px;
+                color: {TEXT_MAIN};
+            }}
+            QListWidget::item:selected {{
+                background: #e8f0fe;
+                color: {TEXT_MAIN};
+            }}
+        """)
+        self.query_list.currentRowChanged.connect(self._on_query_selected)
+        q_vbox.addWidget(self.query_list, 1)
 
-    def _select_editor_cat(self, cat: str):
-        self._editor_cat = cat
-        self._editor_idx = None
-        self._edit_var.set("")
-        for c, btn in self._cat_btn_map.items():
-            if c == "Own Requests":
-                if c == cat:
-                    btn.configure(fg_color=AMZN, text_color="#000000", border_color=AMZN)
-                else:
-                    btn.configure(fg_color="#1f2937", text_color=AMZN, border_color=AMZN)
-            else:
-                if c == cat:
-                    btn.configure(fg_color=AMZN, text_color="#000000")
-                else:
-                    btn.configure(fg_color="transparent", text_color=TEXT_MAIN)
-        self._refresh_query_list()
+        edit_lbl = QLabel("Edit selected query:")
+        edit_lbl.setFont(QFont("Segoe UI", 8))
+        edit_lbl.setStyleSheet(f"color: {TEXT_SUB}; padding: 4px 12px 0 12px;")
+        q_vbox.addWidget(edit_lbl)
 
-    def _refresh_query_list(self):
-        if not self._editor_cat:
+        self.query_edit = QTextEdit()
+        self.query_edit.setFixedHeight(60)
+        self.query_edit.setStyleSheet(f"""
+            QTextEdit {{
+                border: none;
+                border-top: 1px solid {BORDER};
+                background: white;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+                padding: 6px 12px;
+            }}
+        """)
+        q_vbox.addWidget(self.query_edit)
+        split.addWidget(q_frame, 3)
+
+        lay.addLayout(split, 1)
+        return c
+
+    def _on_cat_selected(self, row):
+        if row < 0:
             return
-        try:
-            data = load_amazon_queries()
-            queries = data.get(self._editor_cat, [])
-        except Exception:
-            queries = []
-        self._listbox.delete(0, "end")
-        for i, q in enumerate(queries):
-            self._listbox.insert("end", f"  {q}")
-            if i % 2 == 1:
-                self._listbox.itemconfigure(i, bg=ROW_ALT)
-        self._q_title.configure(text=self._editor_cat)
-        n = len(queries)
-        self._q_count.configure(text=t('queries_count').format(n=n))
+        items = AMAZON_CATEGORIES + ["Own Requests"]
+        if row < len(items):
+            self._current_cat = items[row]
+        else:
+            return
+        self.query_header.setText(f"{self._current_cat} — {len(self._queries.get(self._current_cat, []))} queries")
+        self.query_list.clear()
+        for q in self._queries.get(self._current_cat, []):
+            self.query_list.addItem(q)
 
-    def _on_list_select(self, event):
-        sel = self._listbox.curselection()
-        if sel:
-            self._editor_idx = sel[0]
-            self._edit_var.set(self._listbox.get(sel[0]).strip())
+    def _on_query_selected(self, row):
+        if row < 0 or not self._current_cat:
+            return
+        qs = self._queries.get(self._current_cat, [])
+        if row < len(qs):
+            self.query_edit.setPlainText(qs[row])
 
     def _add_query(self):
-        if not self._editor_cat:
-            messagebox.showwarning("Amazon Warmer", t('select_a_cat'))
+        if not self._current_cat:
             return
-        new_q = self._edit_var.get().strip()
-        if not new_q:
+        text = self.query_edit.toPlainText().strip()
+        if not text:
             return
-        add_amazon_query(self._editor_cat, new_q)
-        self._edit_var.set("")
-        self._refresh_query_list()
+        if self._current_cat not in self._queries:
+            self._queries[self._current_cat] = []
+        self._queries[self._current_cat].append(text)
+        self.query_list.addItem(text)
+        self.query_edit.clear()
+        self._update_cat_header()
 
-    def _delete_query(self):
-        if self._editor_idx is None or not self._editor_cat:
+    def _delete_selected_query(self):
+        if not self._current_cat:
             return
-        q = self._listbox.get(self._editor_idx).strip()
-        if messagebox.askyesno(t('delete'), f'"{q}"?'):
-            remove_amazon_query(self._editor_cat, q)
-            self._editor_idx = None
-            self._edit_var.set("")
-            self._refresh_query_list()
-
-    def _save_edit(self):
-        if self._editor_idx is None or not self._editor_cat:
+        row = self.query_list.currentRow()
+        if row < 0:
             return
-        old = self._listbox.get(self._editor_idx).strip()
-        new = self._edit_var.get().strip()
-        if not new:
-            return
-        update_amazon_query(self._editor_cat, old, new)
-        self._refresh_query_list()
-        if self._editor_idx < self._listbox.size():
-            self._listbox.selection_set(self._editor_idx)
-            self._listbox.see(self._editor_idx)
+        self.query_list.takeItem(row)
+        qs = self._queries.get(self._current_cat, [])
+        if row < len(qs):
+            qs.pop(row)
+        self._update_cat_header()
 
-    # ==========================================================================
-    #  CATEGORY CHECKBOXES
-    # ==========================================================================
+    def _save_current_queries(self):
+        # Sync from list widget
+        if self._current_cat:
+            qs = [self.query_list.item(i).text()
+                  for i in range(self.query_list.count())]
+            self._queries[self._current_cat] = qs
+        self._save_queries()
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Saved", "Queries saved successfully.")
 
-    def _select_all(self):
-        for v in self._cat_vars.values():
-            v.set(True)
-        self._save_categories()
+    def _update_cat_header(self):
+        if self._current_cat:
+            n = len(self._queries.get(self._current_cat, []))
+            self.query_header.setText(f"{self._current_cat} — {n} queries")
 
-    def _deselect_all(self):
-        for v in self._cat_vars.values():
-            v.set(False)
-        self._save_categories()
+    def _set_all_cats(self, checked):
+        for cb in self._cat_checks.values():
+            cb.setChecked(checked)
+        self._own_requests_cb.setChecked(checked)
 
-    def _save_categories(self):
-        selected = [k for k, v in self._cat_vars.items() if v.get()]
-        self.app.settings["amazon_categories"] = selected
-        self.app.save_settings()
+    def _get_selected_categories(self):
+        cats = [cat for cat, cb in self._cat_checks.items() if cb.isChecked()]
+        if self._own_requests_cb.isChecked():
+            cats.append("Own Requests")
+        return cats
 
-    def _save_setting(self, key, value):
-        self.app.settings[key] = value
-        self.app.save_settings()
-
-    # ==========================================================================
-    #  ON_SHOW / PATH STATUS
-    # ==========================================================================
-
-    def on_show(self):
-        self._refresh_path_status()
-        if self._editor_cat:
-            self._refresh_query_list()
-
-    def _refresh_path_status(self):
-        s = self.app.settings
-        ok, msg = geckodriver_util.validate(
-            s.get("firefox_binary", ""),
-            s.get("firefox_profile", ""),
-            s.get("geckodriver_path", ""),
-        )
-        if ok:
-            self._ff_lbl.configure(text=t('ff_ok'), text_color=SUCCESS)
-        else:
-            self._ff_lbl.configure(
-                text=f"{msg}  ({t('nav_settings').strip()})",
-                text_color=ERROR
-            )
-
-    # ==========================================================================
-    #  TIMER
-    # ==========================================================================
-
-    def _tick_timer(self):
-        if self._session_start is None:
-            return
-        elapsed = int(time.time() - self._session_start)
-        m, s = divmod(elapsed, 60)
-        self._elapsed_lbl.configure(text=f"{t('elapsed_prefix')}{m}:{s:02d}")
-        self._timer_job = self.after(1000, self._tick_timer)
-
-    def _stop_timer(self):
-        if self._timer_job:
-            self.after_cancel(self._timer_job)
-            self._timer_job = None
-
-    # ==========================================================================
-    #  SESSION
-    # ==========================================================================
-
-    def _on_progress(self, text: str, pct: int):
-        self.after(0, lambda: self._apply_progress(text, pct))
-
-    def _apply_progress(self, text: str, pct: int):
-        self._phase_lbl.configure(text=text)
-        self._progress_bar.set(pct / 100)
-
-    def _start_session(self):
-        selected = [k for k, v in self._cat_vars.items() if v.get()]
-        if not selected:
-            self._result_lbl.configure(text=t('select_one_cat'), text_color=WARNING)
-            return
-        s = self.app.settings
-        ok, msg = geckodriver_util.validate(
-            s.get("firefox_binary", ""),
-            s.get("firefox_profile", ""),
-            s.get("geckodriver_path", ""),
-        )
-        if not ok:
-            self._result_lbl.configure(text=msg, text_color=ERROR)
-            return
-
-        self._stop_event.clear()
-        self._session_start = time.time()
-        self._start_btn.configure(state="disabled")
-        self._stop_btn.configure(state="normal")
-        self._result_lbl.configure(text=t('session_running'), text_color=TEXT_SUB)
-        self._progress_bar.set(0)
-        self._phase_lbl.configure(text="…")
-        self.app.set_status(t('amzn_running'), AMZN)
-        self.app.start_cursor_highlight(color=AMZN)
-        self.app.start_mouse_blocker(stop_cb=lambda: self.after(0, self._stop_session))
-        self._tick_timer()
-
-        self._thread = threading.Thread(
-            target=self._worker, args=(s, selected), daemon=True
-        )
-        self._thread.start()
-
-    def _worker(self, s: dict, selected: list):
-        from core.browser_bot import create_driver
-        from core.amazon_engine import run_amazon_session, AmazonSessionConfig
-        import time as _time
-
-        driver     = None
-        session_id = None
-        t_start    = _time.time()
-        error_msg  = ""
-
-        session_id = history.start_session(selected, total_phases=1)
-
+    def _check_firefox(self):
         try:
-            driver = create_driver(
-                firefox_binary   = s["firefox_binary"],
-                firefox_profile  = s["firefox_profile"],
-                geckodriver_path = s["geckodriver_path"],
-            )
-            cfg = AmazonSessionConfig(
-                categories      = selected,
-                session_minutes = self._minutes_var.get(),
-                read_reviews    = self._reviews_var.get(),
-                stop_event      = self._stop_event,
-                on_progress     = self._on_progress,
-            )
-            run_amazon_session(driver, cfg)
-        except Exception as exc:
-            error_msg = str(exc)
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+            import os
+            s = self.settings
+            if os.path.exists(s.firefox_binary) and os.path.exists(s.geckodriver):
+                self.firefox_label.setText("Firefox paths configured correctly.")
+                self.firefox_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            else:
+                self.firefox_label.setText("Firefox paths not configured.")
+                self.firefox_label.setStyleSheet("color: #c62828; font-weight: bold;")
+        except Exception:
+            self.firefox_label.setText("")
 
-            stopped    = self._stop_event.is_set()
-            duration_s = _time.time() - t_start
-            if session_id:
-                if error_msg:
-                    db_status, done = "partial", 0
-                elif stopped:
-                    db_status, done = "stopped", 0
-                else:
-                    db_status, done = "completed", 1
-                history.log_phase(
-                    session_id,
-                    phase_name = "Amazon Warm-up",
-                    category   = ", ".join(selected),
-                    status     = db_status,
-                    duration_s = round(duration_s, 1),
+    def _start(self):
+        cats = self._get_selected_categories()
+        if not cats:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No categories",
+                                "Select at least one Amazon category.")
+            return
+
+        self._stop_event = threading.Event()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.main_window.set_status("Amazon Running", ACCENT2)
+
+        from core.amazon_engine import AmazonSessionConfig, run_amazon_session
+        from core import browser_bot as bot
+
+        cfg = AmazonSessionConfig(
+            categories=cats,
+            session_minutes=self.sl_duration.value(),
+            read_reviews=self.cb_reviews.isChecked(),
+            stop_event=self._stop_event,
+            on_progress=self._emit_progress,
+        )
+
+        def worker():
+            driver = None
+            try:
+                driver = bot.create_driver(
+                    self.settings.firefox_binary,
+                    self.settings.firefox_profile,
+                    self.settings.geckodriver,
                 )
-                history.end_session(session_id, done, db_status)
+                bot.set_captcha_handler(None, self._stop_event)
+                run_amazon_session(driver, cfg)
+            except Exception as e:
+                self._emit_progress(f"Error: {e}", 0)
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                bot.clear_captcha_handler()
+                self._emit_status("Idle", "#5a6a8a")
 
-            self.after(0, lambda st=stopped: self._session_finished(not st))
+        threading.Thread(target=worker, daemon=True).start()
 
-    def _stop_session(self):
-        self._stop_event.set()
-        self.app.stop_mouse_blocker()
-        self._stop_btn.configure(state="disabled")
-        self._result_lbl.configure(text=t('stopping'), text_color=WARNING)
-        self.app.set_status(t('amzn_stopping'), WARNING)
-        self.app.stop_cursor_highlight()
+    def _stop(self):
+        if self._stop_event:
+            self._stop_event.set()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.main_window.set_status("Idle", "#5a6a8a")
 
-    def _session_finished(self, success: bool, error: str = ""):
-        self._stop_timer()
-        self.app.stop_cursor_highlight()
-        self.app.stop_mouse_blocker()
-        self._session_start = None
-        self._start_btn.configure(state="normal")
-        self._stop_btn.configure(state="disabled")
-        if success and not self._stop_event.is_set():
-            self._result_lbl.configure(text=t('session_complete'), text_color=SUCCESS)
-            self.app.set_status(t('amzn_done'), SUCCESS)
-            self._progress_bar.set(1.0)
-            self._phase_lbl.configure(text=t('status_done') + '.')
-        elif self._stop_event.is_set():
-            self._result_lbl.configure(text=t('stopped_msg'), text_color=WARNING)
-            self.app.set_status(t('amzn_stopped'), WARNING)
-        else:
-            self._result_lbl.configure(
-                text=f"{t('status_error')}: {error[:80]}",
-                text_color=ERROR
-            )
-            self.app.set_status(t('amzn_error'), ERROR)
+    def _emit_progress(self, text, pct):
+        self._sig_progress.emit(text, int(pct))
 
-    # ==========================================================================
-    #  LANGUAGE UPDATE
-    # ==========================================================================
+    def _emit_status(self, text, color):
+        self._sig_status.emit(text, color)
 
-    def update_lang(self):
-        saved_cat   = self._editor_cat
-        was_running = self._session_start is not None
-        self._stop_timer()
-        for w in self.winfo_children():
-            w.destroy()
-        self._editor_cat = None
-        self._editor_idx = None
-        self._build()
-        if saved_cat:
-            self._select_editor_cat(saved_cat)
-        if was_running:
-            self._session_start = time.time()
-            self._tick_timer()
-        self._refresh_path_status()
+    def _on_progress(self, text, pct):
+        self.progress_label.setText(text)
+        self.progress_bar.setValue(pct)
+        if pct >= 100:
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+
+    def _on_status(self, text, color):
+        self.main_window.set_status(text, color)
