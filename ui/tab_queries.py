@@ -1,272 +1,312 @@
-"""
-ui/tab_queries.py  --  Browse and edit the queries library.
-"""
-
-import csv
-import io
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import customtkinter as ctk
-
-from core.query_selector import (
-    load_queries, get_categories, add_query, remove_query, update_query
+import json
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QTextEdit,
+    QFrame, QFileDialog, QMessageBox, QSplitter
 )
-from core.i18n import t
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 
-CT_BG    = "#f1f5f9"
-CARD_BG  = "#ffffff"
-BORDER   = "#e2e8f0"
-TEXT_MAIN= "#0f172a"
-TEXT_SUB = "#64748b"
-ACCENT   = "#3b82f6"
-SUCCESS  = "#22c55e"
-ERROR    = "#ef4444"
-WARNING  = "#f59e0b"
-ROW_ALT  = "#f8fafc"
+from ui.styles import (
+    page_title, card, section_title, primary_btn, danger_btn,
+    secondary_btn, BG_PAGE, ACCENT, TEXT_SUB, TEXT_MAIN, BORDER
+)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR  = BASE_DIR / "data"
+
+CATEGORIES = [
+    "News & Events", "Weather", "YouTube", "Reddit",
+    "Wikipedia", "Shopping", "Food & Recipes", "Health & Wellness",
+    "Travel & Tourism", "Technology",
+]
 
 
-class QueriesTab(ctk.CTkFrame):
-    def __init__(self, parent, app):
-        super().__init__(parent, fg_color=CT_BG, corner_radius=0)
-        self.app = app
-        self._selected_cat = None
-        self._selected_idx = None
-        self._build()
+class QueriesTab(QWidget):
+    def __init__(self, settings, main_window):
+        super().__init__()
+        self.settings     = settings
+        self.main_window  = main_window
+        self._queries     = {}
+        self._current_cat = None
 
-    def _build(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.setStyleSheet(f"background: {BG_PAGE};")
+        self._load_queries()
+        self._build_ui()
 
-        # Header
-        hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 0))
-        ctk.CTkLabel(hdr, text=t('queries_title'),
-                     font=("Helvetica", 20, "bold"),
-                     text_color=TEXT_MAIN).pack(side="left")
-        ctk.CTkButton(hdr, text=t('export_csv'), width=100, height=32,
-                      font=("Helvetica", 12), fg_color=TEXT_SUB,
-                      command=self._export_csv).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(hdr, text=t('import_csv'), width=100, height=32,
-                      font=("Helvetica", 12), fg_color=ACCENT,
-                      command=self._import_csv).pack(side="right")
+    # ── Data ─────────────────────────────────────────────────────────────────
+    def _load_queries(self):
+        path = DATA_DIR / "queries.json"
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._queries = json.load(f)
+            except Exception:
+                self._queries = {}
 
-        # Two-pane body
-        pane = ctk.CTkFrame(self, fg_color="transparent")
-        pane.grid(row=1, column=0, sticky="nsew", padx=24, pady=12)
-        pane.grid_columnconfigure(1, weight=1)
-        pane.grid_rowconfigure(0, weight=1)
+    def _save_queries(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(DATA_DIR / "queries.json", "w", encoding="utf-8") as f:
+                json.dump(self._queries, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", str(e))
 
-        # Left: category list
-        left = ctk.CTkFrame(pane, fg_color=CARD_BG, corner_radius=10,
-                            border_width=1, border_color=BORDER, width=180)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left.grid_propagate(False)
-        left.grid_rowconfigure(1, weight=1)
+    # ── UI ───────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setSpacing(16)
 
-        ctk.CTkLabel(left, text=t('categories'),
-                     font=("Helvetica", 13, "bold"),
-                     text_color=TEXT_MAIN).grid(
-            row=0, column=0, padx=12, pady=(12, 4), sticky="w")
-        ctk.CTkFrame(left, height=1, fg_color=BORDER).grid(
-            row=0, column=0, sticky="sew", padx=8)
+        # Title + CSV buttons
+        title_row = QHBoxLayout()
+        title_row.addWidget(page_title("Query Library"))
+        title_row.addStretch()
+        btn_import = primary_btn("Import CSV")
+        btn_import.setFixedWidth(110)
+        btn_import.clicked.connect(self._import_csv)
+        btn_export = secondary_btn("Export CSV")
+        btn_export.setFixedWidth(110)
+        btn_export.clicked.connect(self._export_csv)
+        title_row.addWidget(btn_import)
+        title_row.addWidget(btn_export)
+        outer.addLayout(title_row)
 
-        cat_scroll = ctk.CTkScrollableFrame(left, fg_color="transparent",
-                                             corner_radius=0)
-        cat_scroll.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-        left.grid_columnconfigure(0, weight=1)
+        # ── Main card ─────────────────────────────────────────────────────
+        c = card()
+        c_lay = QVBoxLayout(c)
+        c_lay.setContentsMargins(0, 0, 0, 0)
+        c_lay.setSpacing(0)
 
-        self._cat_buttons = {}
-        for cat in get_categories():
-            btn = ctk.CTkButton(
-                cat_scroll, text=cat, anchor="w",
-                font=("Helvetica", 12), height=32,
-                fg_color="transparent", text_color=TEXT_MAIN,
-                hover_color=BORDER, corner_radius=6,
-                command=lambda c=cat: self._select_category(c))
-            btn.pack(fill="x", padx=4, pady=1)
-            self._cat_buttons[cat] = btn
+        # Action buttons row
+        btn_bar = QWidget()
+        btn_bar.setStyleSheet(f"background: #f8f9fc; border-bottom: 1px solid {BORDER};")
+        bar_lay = QHBoxLayout(btn_bar)
+        bar_lay.setContentsMargins(16, 10, 16, 10)
+        bar_lay.setSpacing(8)
+        bar_lay.addStretch()
 
-        # Right: query list + editor
-        right = ctk.CTkFrame(pane, fg_color=CARD_BG, corner_radius=10,
-                             border_width=1, border_color=BORDER)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_rowconfigure(1, weight=1)
-        right.grid_columnconfigure(0, weight=1)
+        self.btn_save = secondary_btn("Save")
+        self.btn_save.setFixedWidth(70)
+        self.btn_save.clicked.connect(self._save_current)
 
-        # Toolbar
-        tb = ctk.CTkFrame(right, fg_color="transparent")
-        tb.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
-        self._cat_title = ctk.CTkLabel(tb, text=t('select_a_cat'),
-                                        font=("Helvetica", 13, "bold"),
-                                        text_color=TEXT_MAIN)
-        self._cat_title.pack(side="left")
-        self._count_lbl = ctk.CTkLabel(tb, text="",
-                                        font=("Helvetica", 11), text_color=TEXT_SUB)
-        self._count_lbl.pack(side="left", padx=8)
-        ctk.CTkButton(tb, text=t('add'), width=72, height=28,
-                      font=("Helvetica", 12), fg_color=SUCCESS,
-                      command=self._add_query).pack(side="right", padx=(4, 0))
-        ctk.CTkButton(tb, text=t('delete'), width=72, height=28,
-                      font=("Helvetica", 12), fg_color=ERROR,
-                      command=self._delete_query).pack(side="right", padx=4)
-        ctk.CTkButton(tb, text=t('save'), width=72, height=28,
-                      font=("Helvetica", 12), fg_color=ACCENT,
-                      command=self._save_edit).pack(side="right")
-        ctk.CTkFrame(right, height=1, fg_color=BORDER).grid(
-            row=0, column=0, sticky="sew", padx=8)
+        self.btn_delete = danger_btn("Delete")
+        self.btn_delete.setFixedWidth(80)
+        self.btn_delete.clicked.connect(self._delete_selected)
 
-        # Listbox
-        list_frame = ctk.CTkFrame(right, fg_color="transparent")
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 0))
-        list_frame.grid_rowconfigure(0, weight=1)
-        list_frame.grid_columnconfigure(0, weight=1)
-        self._listbox = tk.Listbox(list_frame, font=("Helvetica", 11),
-                                    bg=CARD_BG, fg=TEXT_MAIN,
-                                    selectbackground=ACCENT, selectforeground="#ffffff",
-                                    bd=0, highlightthickness=0, activestyle="none",
-                                    relief="flat")
-        self._listbox.grid(row=0, column=0, sticky="nsew")
-        sb = tk.Scrollbar(list_frame, orient="vertical",
-                           command=self._listbox.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self._listbox.configure(yscrollcommand=sb.set)
-        self._listbox.bind("<<ListboxSelect>>", self._on_list_select)
+        self.btn_add = primary_btn("+ Add")
+        self.btn_add.setFixedWidth(80)
+        self.btn_add.clicked.connect(self._add_query)
 
-        # Edit area
-        edit_frame = ctk.CTkFrame(right, fg_color="transparent")
-        edit_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=8)
-        edit_frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(edit_frame, text=t('edit_query_lbl'),
-                     font=("Helvetica", 11), text_color=TEXT_SUB).grid(
-            row=0, column=0, sticky="w")
-        self._edit_var = tk.StringVar()
-        self._edit_entry = ctk.CTkEntry(edit_frame, textvariable=self._edit_var,
-                                         height=32, font=("Helvetica", 12),
-                                         fg_color=CT_BG, border_color=BORDER,
-                                         text_color=TEXT_MAIN)
-        self._edit_entry.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        self._edit_entry.bind("<Return>", lambda e: self._save_edit())
+        bar_lay.addWidget(self.btn_save)
+        bar_lay.addWidget(self.btn_delete)
+        bar_lay.addWidget(self.btn_add)
+        c_lay.addWidget(btn_bar)
 
-    # ── Category selection ───────────────────────────────────
-    def _select_category(self, cat):
-        self._selected_cat = cat
-        self._selected_idx = None
-        self._edit_var.set("")
-        for c, btn in self._cat_buttons.items():
-            btn.configure(fg_color=ACCENT if c == cat else "transparent",
-                          text_color="#ffffff" if c == cat else TEXT_MAIN)
-        self._refresh_list()
+        # Splitter: categories | queries
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: #e0e5f0; width: 1px; }")
 
-    def _refresh_list(self):
-        if not self._selected_cat:
+        # Left: categories
+        cat_widget = QWidget()
+        cat_widget.setStyleSheet("background: white;")
+        cat_vbox = QVBoxLayout(cat_widget)
+        cat_vbox.setContentsMargins(0, 0, 0, 0)
+        cat_vbox.setSpacing(0)
+
+        cat_hdr = QLabel("Categories")
+        cat_hdr.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        cat_hdr.setStyleSheet(
+            f"color: {TEXT_SUB}; padding: 12px 16px 8px 16px;"
+            f" border-bottom: 1px solid {BORDER};")
+        cat_vbox.addWidget(cat_hdr)
+
+        self.cat_list = QListWidget()
+        self.cat_list.setStyleSheet(f"""
+            QListWidget {{
+                border: none;
+                background: transparent;
+                font-family: 'Segoe UI';
+                font-size: 10pt;
+            }}
+            QListWidget::item {{
+                padding: 9px 16px;
+                color: {TEXT_MAIN};
+                border-bottom: 1px solid #f0f2f8;
+            }}
+            QListWidget::item:selected {{
+                background: #e8f0fe;
+                color: {ACCENT};
+                font-weight: bold;
+            }}
+            QListWidget::item:hover:!selected {{
+                background: #f4f6fc;
+            }}
+        """)
+        for cat in CATEGORIES:
+            self.cat_list.addItem(cat)
+        self.cat_list.currentRowChanged.connect(self._on_cat_selected)
+        cat_vbox.addWidget(self.cat_list)
+        splitter.addWidget(cat_widget)
+
+        # Right: queries + edit
+        q_widget = QWidget()
+        q_widget.setStyleSheet("background: white;")
+        q_vbox = QVBoxLayout(q_widget)
+        q_vbox.setContentsMargins(0, 0, 0, 0)
+        q_vbox.setSpacing(0)
+
+        self.q_header = QLabel("Select a category")
+        self.q_header.setFont(QFont("Segoe UI", 10))
+        self.q_header.setStyleSheet(
+            f"color: {TEXT_SUB}; padding: 12px 16px 8px 16px;"
+            f" border-bottom: 1px solid {BORDER};")
+        q_vbox.addWidget(self.q_header)
+
+        self.query_list = QListWidget()
+        self.query_list.setStyleSheet(f"""
+            QListWidget {{
+                border: none;
+                background: transparent;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+            }}
+            QListWidget::item {{
+                padding: 7px 16px;
+                color: {TEXT_MAIN};
+                border-bottom: 1px solid #f8f9fc;
+            }}
+            QListWidget::item:selected {{
+                background: #e8f0fe;
+                color: {TEXT_MAIN};
+            }}
+        """)
+        self.query_list.currentRowChanged.connect(self._on_query_selected)
+        q_vbox.addWidget(self.query_list, 1)
+
+        # Edit bar at bottom
+        edit_bar = QWidget()
+        edit_bar.setStyleSheet(
+            f"background: #f8f9fc; border-top: 1px solid {BORDER};")
+        edit_lay = QVBoxLayout(edit_bar)
+        edit_lay.setContentsMargins(16, 8, 16, 8)
+        edit_lbl = QLabel("Edit query:")
+        edit_lbl.setFont(QFont("Segoe UI", 8))
+        edit_lbl.setStyleSheet(f"color: {TEXT_SUB};")
+        edit_lay.addWidget(edit_lbl)
+        self.query_edit = QTextEdit()
+        self.query_edit.setFixedHeight(52)
+        self.query_edit.setStyleSheet(f"""
+            QTextEdit {{
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                background: white;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+                padding: 4px 8px;
+            }}
+        """)
+        edit_lay.addWidget(self.query_edit)
+        q_vbox.addWidget(edit_bar)
+        splitter.addWidget(q_widget)
+
+        splitter.setSizes([260, 740])
+        c_lay.addWidget(splitter, 1)
+        outer.addWidget(c, 1)
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+    def _on_cat_selected(self, row):
+        if row < 0 or row >= len(CATEGORIES):
             return
-        data = load_queries()
-        queries = data.get(self._selected_cat, [])
-        self._listbox.delete(0, "end")
-        for q in queries:
-            self._listbox.insert("end", q)
-        self._cat_title.configure(text=self._selected_cat)
-        n = len(queries)
-        self._count_lbl.configure(
-            text=t('queries_count').format(n=n))
+        self._current_cat = CATEGORIES[row]
+        qs = self._queries.get(self._current_cat, [])
+        self.q_header.setText(
+            f"{self._current_cat}  —  {len(qs)} queries")
+        self.query_list.clear()
+        for q in qs:
+            self.query_list.addItem(q)
 
-    def _on_list_select(self, event):
-        sel = self._listbox.curselection()
-        if sel:
-            self._selected_idx = sel[0]
-            self._edit_var.set(self._listbox.get(sel[0]))
+    def _on_query_selected(self, row):
+        if row < 0 or not self._current_cat:
+            return
+        qs = self._queries.get(self._current_cat, [])
+        if row < len(qs):
+            self.query_edit.setPlainText(qs[row])
 
-    # ── CRUD ─────────────────────────────────────────────────
     def _add_query(self):
-        if not self._selected_cat:
-            messagebox.showwarning("WarmUpPro", t('select_a_cat'))
+        if not self._current_cat:
+            QMessageBox.information(self, "Info", "Select a category first.")
             return
-        new_q = self._edit_var.get().strip()
-        if not new_q:
+        text = self.query_edit.toPlainText().strip()
+        if not text:
             return
-        add_query(self._selected_cat, new_q)
-        self._edit_var.set("")
-        self._refresh_list()
+        self._queries.setdefault(self._current_cat, []).append(text)
+        self.query_list.addItem(text)
+        self.query_edit.clear()
+        self._refresh_header()
 
-    def _delete_query(self):
-        if self._selected_idx is None or not self._selected_cat:
+    def _delete_selected(self):
+        if not self._current_cat:
             return
-        q = self._listbox.get(self._selected_idx)
-        if messagebox.askyesno(t('delete'), f'"{q}"?'):
-            remove_query(self._selected_cat, q)
-            self._selected_idx = None
-            self._edit_var.set("")
-            self._refresh_list()
+        row = self.query_list.currentRow()
+        if row < 0:
+            return
+        self.query_list.takeItem(row)
+        qs = self._queries.get(self._current_cat, [])
+        if row < len(qs):
+            qs.pop(row)
+        self._refresh_header()
 
-    def _save_edit(self):
-        if self._selected_idx is None or not self._selected_cat:
-            return
-        old_text = self._listbox.get(self._selected_idx)
-        new_text = self._edit_var.get().strip()
-        if not new_text:
-            return
-        update_query(self._selected_cat, old_text, new_text)
-        self._refresh_list()
-        if self._selected_idx < self._listbox.size():
-            self._listbox.selection_set(self._selected_idx)
-            self._listbox.see(self._selected_idx)
+    def _save_current(self):
+        if self._current_cat:
+            qs = [self.query_list.item(i).text()
+                  for i in range(self.query_list.count())]
+            self._queries[self._current_cat] = qs
+        self._save_queries()
+        QMessageBox.information(self, "Saved", "Queries saved successfully.")
 
-    # ── CSV ──────────────────────────────────────────────────
-    def _export_csv(self):
-        path = filedialog.asksaveasfilename(
-            title=t('export_csv'),
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if not path:
-            return
-        data = load_queries()
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["category", "query"])
-            for cat, queries in data.items():
-                for q in queries:
-                    writer.writerow([cat, q])
-        messagebox.showinfo("WarmUpPro",
-            f"{sum(len(v) for v in data.values())} queries exported.")
+    def _refresh_header(self):
+        if self._current_cat:
+            n = len(self._queries.get(self._current_cat, []))
+            self.q_header.setText(f"{self._current_cat}  —  {n} queries")
 
     def _import_csv(self):
-        path = filedialog.askopenfilename(
-            title=t('import_csv'),
-            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import CSV", "", "CSV Files (*.csv)")
         if not path:
             return
-        count = 0
         try:
+            import csv
             with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
+                reader = csv.reader(f)
                 for row in reader:
-                    cat = row.get("category", "").strip()
-                    q   = row.get("query", "").strip()
-                    if cat and q:
-                        add_query(cat, q)
-                        count += 1
+                    if len(row) >= 2:
+                        cat, query = row[0].strip(), row[1].strip()
+                        if cat and query:
+                            self._queries.setdefault(cat, []).append(query)
+            self._save_queries()
+            if self._current_cat:
+                self._on_cat_selected(
+                    CATEGORIES.index(self._current_cat)
+                    if self._current_cat in CATEGORIES else -1)
+            QMessageBox.information(self, "Imported", "CSV imported successfully.")
         except Exception as e:
-            messagebox.showerror("Import failed", str(e))
+            QMessageBox.warning(self, "Import Error", str(e))
+
+    def _export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export CSV", "queries.csv", "CSV Files (*.csv)")
+        if not path:
             return
-        messagebox.showinfo("WarmUpPro", f"{count} queries imported.")
-        self._refresh_list()
-
-    def on_show(self):
-        if self._selected_cat:
-            self._refresh_list()
-
-    # ── Language update ──────────────────────────────────────
-    def update_lang(self):
-        saved_cat = self._selected_cat
-        saved_idx = self._selected_idx
-        for w in self.winfo_children():
-            w.destroy()
-        self._selected_cat = None
-        self._selected_idx = None
-        self._build()
-        if saved_cat:
-            self._select_category(saved_cat)
-            if saved_idx is not None and saved_idx < self._listbox.size():
-                self._listbox.selection_set(saved_idx)
-                self._listbox.see(saved_idx)
-                self._selected_idx = saved_idx
+        try:
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                for cat, qs in self._queries.items():
+                    for q in qs:
+                        writer.writerow([cat, q])
+            QMessageBox.information(self, "Exported", "Queries exported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
