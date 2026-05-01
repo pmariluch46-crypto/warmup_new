@@ -43,15 +43,27 @@ def send_mouse_move_fallback(dx, dy):
 
 
 def move_absolute_smooth(x, y, steps=200):
-    """Плавное движение мыши к абсолютной точке."""
     import pyautogui
     cur_x, cur_y = pyautogui.position()
 
-    for i in range(1, steps + 1):
-        t = i / steps
+    # Добавляем небольшую случайность в количество шагов
+    steps = int(steps * random.uniform(0.85, 1.25))
 
+    # Генерируем нелинейную кривую ускорения/замедления
+    def ease(t):
+        # t от 0 до 1
+        return t * t * (3 - 2 * t)  # smoothstep
+
+    for i in range(1, steps + 1):
+        t = ease(i / steps)
+
+        # Нелинейное движение
         nx = cur_x + (x - cur_x) * t
         ny = cur_y + (y - cur_y) * t
+
+        # Микродрожание (jitter)
+        nx += random.uniform(-0.6, 0.6)
+        ny += random.uniform(-0.6, 0.6)
 
         dx = int(nx - cur_x)
         dy = int(ny - cur_y)
@@ -64,5 +76,15 @@ def move_absolute_smooth(x, y, steps=200):
 
         cur_x, cur_y = nx, ny
 
-        # 120–240 FPS
-        time.sleep(random.uniform(0.004, 0.009))
+        # FPS + случайные задержки
+        time.sleep(random.uniform(0.004, 0.012))
+
+    # Финальная микро‑коррекция (как у человека)
+    if random.random() < 0.7:
+        fx = x + random.randint(-2, 2)
+        fy = y + random.randint(-2, 2)
+        send_mouse_move(fx - int(cur_x), fy - int(cur_y))
+        time.sleep(random.uniform(0.02, 0.05))
+
+    # Последний шаг — точное попадание
+    send_mouse_move(x - int(cur_x), y - int(cur_y))
