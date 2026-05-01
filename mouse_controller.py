@@ -4,45 +4,60 @@ import ctypes
 from core.mouse import (
     move_bezier_to,
     move_s_curve_to,
-    move_linear_to,
     micro_corrections
 )
 
 
 class MouseController:
-    def __init__(self, mode: str = "normal"):
+    def __init__(self, mode="normal"):
         self.mode = mode
 
-    def move_to(self, x: int, y: int):
-        move_linear_to(x, y, self.mode)
-
-    def click(self, x: int, y: int):
-        move_bezier_to(x, y, self.mode)
-        micro_corrections(x, y)
-        time.sleep(random.uniform(0.03, 0.07))
-        self.left_click()
-
-    def super_click(self, x: int, y: int):
+    def _human_jitter(self, x, y):
+        """Микродвижения мыши перед кликом."""
         import pyautogui
-        start_x, start_y = pyautogui.position()
-        distance = ((x - start_x)**2 + (y - start_y)**2) ** 0.5
+        for _ in range(random.randint(1, 3)):
+            jx = x + random.randint(-2, 2)
+            jy = y + random.randint(-2, 2)
+            move_s_curve_to(jx, jy, self.mode, steps_override=12, offset_scale=0.15)
+            time.sleep(random.uniform(0.02, 0.06))
 
-        if distance < 120:
-            move_s_curve_to(x, y, self.mode, steps_override=35, offset_scale=0.25)
-        elif distance < 350:
-            move_s_curve_to(x, y, self.mode, steps_override=55, offset_scale=0.45)
-        else:
-            mid_x = int(x + random.uniform(-20, 20))
-            mid_y = int(y + random.uniform(-20, 20))
-            move_s_curve_to(mid_x, mid_y, self.mode, steps_override=60, offset_scale=0.35)
-            time.sleep(random.uniform(0.01, 0.03))
-            move_s_curve_to(x, y, self.mode, steps_override=40, offset_scale=0.25)
+    def move_to(self, x, y):
+        """Человеческое движение мыши."""
+        # 10% шанс промаха
+        if random.random() < 0.10:
+            miss_x = x + random.randint(-8, 8)
+            miss_y = y + random.randint(-8, 8)
+            move_s_curve_to(miss_x, miss_y, self.mode, steps_override=45, offset_scale=0.35)
+            time.sleep(random.uniform(0.05, 0.12))
 
+        move_s_curve_to(x, y, self.mode, steps_override=55, offset_scale=0.30)
+
+    def click(self, x, y):
+        self.move_to(x, y)
+
+        # микро‑дрожание
+        self._human_jitter(x, y)
+
+        # микро‑коррекция
         micro_corrections(x, y)
-        time.sleep(random.uniform(0.01, 0.03))
+
+        time.sleep(random.uniform(0.05, 0.12))
         self.left_click()
 
-    def scroll(self, amount: int):
+    def super_click(self, x, y):
+        self.move_to(x, y)
+
+        # небольшая пауза как у человека
+        time.sleep(random.uniform(0.03, 0.08))
+
+        self._human_jitter(x, y)
+        micro_corrections(x, y)
+
+        time.sleep(random.uniform(0.02, 0.05))
+        self.left_click()
+
+    def scroll(self, amount):
+        """Человеческий скролл с инерцией."""
         MOUSEEVENTF_WHEEL = 0x0800
         WHEEL_DELTA = 120
 
@@ -58,14 +73,21 @@ class MouseController:
 
             for _ in range(burst):
                 delta = WHEEL_DELTA * direction
+
+                # иногда человек чуть скроллит в обратную сторону
+                if random.random() < 0.05:
+                    delta = -delta
+
                 ctypes.windll.user32.mouse_event(
                     MOUSEEVENTF_WHEEL, 0, 0,
                     ctypes.c_ulong(delta).value, 0
                 )
-                time.sleep(random.uniform(0.008, 0.018))
 
-            if remaining > 0:
-                time.sleep(random.uniform(0.05, 0.15))
+                # естественная задержка
+                time.sleep(random.uniform(0.01, 0.04))
+
+            # пауза между “рывками”
+            time.sleep(random.uniform(0.15, 0.35))
 
     def left_click(self):
         import pyautogui
