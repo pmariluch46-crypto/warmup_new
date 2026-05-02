@@ -1,263 +1,329 @@
-"""
-ui/tab_scheduler.py  --  Scheduler tab.
-"""
+import json
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QFrame, QLineEdit, QMessageBox, QScrollArea, QCheckBox
+)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 
-import datetime
-import threading
-import time
-import tkinter as tk
-from tkinter import messagebox
-import customtkinter as ctk
+from ui.styles import (
+    page_title, card, section_title,
+    primary_btn, danger_btn, success_btn, secondary_btn,
+    BG_PAGE, ACCENT, TEXT_SUB, TEXT_MAIN, BORDER
+)
 
-from core.i18n import t
-
-CT_BG    = "#f1f5f9"
-CARD_BG  = "#ffffff"
-BORDER   = "#e2e8f0"
-TEXT_MAIN= "#0f172a"
-TEXT_SUB = "#64748b"
-ACCENT   = "#3b82f6"
-SUCCESS  = "#22c55e"
-ERROR    = "#ef4444"
-WARNING  = "#f59e0b"
-
-DAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday",
-           "Friday", "Saturday", "Sunday"]
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR  = BASE_DIR / "data"
+DAYS      = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAYS_FULL = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
 
-class SchedulerTab(ctk.CTkFrame):
-    def __init__(self, parent, app):
-        super().__init__(parent, fg_color=CT_BG, corner_radius=0)
-        self.app = app
-        self._sched_thread = None
-        self._stop_event   = threading.Event()
-        self._jobs = []
-        self._build()
+class SchedulerTab(QWidget):
+    def __init__(self, settings, main_window):
+        super().__init__()
+        self.settings     = settings
+        self.main_window  = main_window
+        self._jobs        = []
+        self._enabled     = False
+        self._check_timer = QTimer(self)
+        self._check_timer.timeout.connect(self._check_schedule)
+        self.setStyleSheet(f"background: {BG_PAGE};")
+        self._load_jobs()
+        self._build_ui()
 
-    def _build(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+    # ── Persistence ───────────────────────────────────────────────────────
+    def _load_jobs(self):
+        self._jobs    = self.settings.get("scheduled_jobs", [])
+        self._enabled = self.settings.get("scheduler_enabled", False)
 
-        ctk.CTkLabel(self, text=t('scheduler_title'),
-                     font=("Helvetica", 20, "bold"),
-                     text_color=TEXT_MAIN).grid(
-            row=0, column=0, sticky="w", padx=24, pady=(20, 0))
+    def _save_jobs(self):
+        self.settings.set("scheduled_jobs",    self._jobs)
+        self.settings.set("scheduler_enabled", self._enabled)
+        self.settings.save_all()
 
-        body = ctk.CTkScrollableFrame(self, fg_color=CT_BG, corner_radius=0)
-        body.grid(row=1, column=0, sticky="nsew")
-        body.grid_columnconfigure(0, weight=1)
+    # ── UI ────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"background: {BG_PAGE};")
 
-        # Status card
-        status_card = self._card(body, row=0, title=t('sched_status_card'))
-        self._sched_status = ctk.CTkLabel(
-            status_card, text=t('sched_off'),
-            font=("Helvetica", 13), text_color=TEXT_SUB)
-        self._sched_status.pack(anchor="w", padx=16, pady=(4, 4))
-        self._next_lbl = ctk.CTkLabel(
-            status_card, text=t('next_run_dash'),
-            font=("Helvetica", 12), text_color=TEXT_SUB)
-        self._next_lbl.pack(anchor="w", padx=16, pady=(0, 12))
+        content = QWidget()
+        content.setStyleSheet(f"background: {BG_PAGE};")
+        vbox = QVBoxLayout(content)
+        vbox.setContentsMargins(28, 24, 28, 24)
+        vbox.setSpacing(16)
 
-        btn_row = ctk.CTkFrame(status_card, fg_color="transparent")
-        btn_row.pack(anchor="w", padx=16, pady=(0, 12))
-        self._toggle_btn = ctk.CTkButton(
-            btn_row, text=t('enable_sched'), height=36, width=180,
-            font=("Helvetica", 13, "bold"),
-            fg_color=SUCCESS, hover_color="#16a34a",
-            command=self._toggle_scheduler)
-        self._toggle_btn.pack(side="left")
+        vbox.addWidget(page_title("Scheduler"))
+        vbox.addWidget(self._build_status_card())
+        vbox.addWidget(self._build_add_job_card())
 
-        # Builder card
-        builder = self._card(body, row=1, title=t('add_sched_run'))
+        # Jobs list card
+        jobs_card = card()
+        jobs_lay  = QVBoxLayout(jobs_card)
+        jobs_lay.setContentsMargins(20, 16, 20, 16)
+        jobs_lay.setSpacing(8)
+        jobs_lay.addWidget(section_title("Scheduled Jobs"))
+        self.jobs_container = QVBoxLayout()
+        self.jobs_container.setSpacing(6)
+        jobs_lay.addLayout(self.jobs_container)
+        vbox.addWidget(jobs_card)
 
-        ctk.CTkLabel(builder, text=t('days_of_week'),
-                     font=("Helvetica", 12), text_color=TEXT_MAIN).pack(
-            anchor="w", padx=16, pady=(4, 4))
-        day_row = ctk.CTkFrame(builder, fg_color="transparent")
-        day_row.pack(fill="x", padx=16, pady=(0, 8))
-        self._day_vars = {}
-        days_short = t('days_short')
-        for i, d in enumerate(DAYS_EN):
-            var = tk.BooleanVar(value=False)
-            ctk.CTkCheckBox(day_row, text=days_short[i], variable=var, width=60,
-                            font=("Helvetica", 11), text_color=TEXT_MAIN,
-                            fg_color=ACCENT, checkmark_color="#ffffff").pack(
-                side="left", padx=2)
-            self._day_vars[d] = var
+        vbox.addWidget(self._build_note_card())
+        vbox.addStretch()
 
-        time_row = ctk.CTkFrame(builder, fg_color="transparent")
-        time_row.pack(fill="x", padx=16, pady=(0, 8))
-        ctk.CTkLabel(time_row, text=t('time_label'),
-                     font=("Helvetica", 12), text_color=TEXT_MAIN,
-                     width=140, anchor="w").pack(side="left")
-        self._hour_var = tk.StringVar(value="09")
-        self._min_var  = tk.StringVar(value="00")
-        ctk.CTkEntry(time_row, textvariable=self._hour_var,
-                     width=50, height=30, font=("Helvetica", 12),
-                     fg_color=CT_BG, border_color=BORDER,
-                     text_color=TEXT_MAIN, justify="center").pack(side="left")
-        ctk.CTkLabel(time_row, text=":", font=("Helvetica", 14, "bold"),
-                     text_color=TEXT_MAIN).pack(side="left", padx=4)
-        ctk.CTkEntry(time_row, textvariable=self._min_var,
-                     width=50, height=30, font=("Helvetica", 12),
-                     fg_color=CT_BG, border_color=BORDER,
-                     text_color=TEXT_MAIN, justify="center").pack(side="left")
+        scroll.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
-        lbl_row = ctk.CTkFrame(builder, fg_color="transparent")
-        lbl_row.pack(fill="x", padx=16, pady=(0, 8))
-        ctk.CTkLabel(lbl_row, text=t('label_optional'),
-                     font=("Helvetica", 12), text_color=TEXT_MAIN,
-                     width=140, anchor="w").pack(side="left")
-        self._label_var = tk.StringVar()
-        ctk.CTkEntry(lbl_row, textvariable=self._label_var,
-                     height=30, font=("Helvetica", 12),
-                     fg_color=CT_BG, border_color=BORDER,
-                     text_color=TEXT_MAIN).pack(side="left", fill="x", expand=True)
-
-        ctk.CTkButton(builder, text=t('add_job'), height=34, width=120,
-                      font=("Helvetica", 12, "bold"),
-                      fg_color=ACCENT, hover_color="#2563eb",
-                      command=self._add_job).pack(anchor="w", padx=16, pady=(0, 12))
-
-        # Jobs list
-        jobs_card = self._card(body, row=2, title=t('sched_jobs'))
-        self._jobs_frame = ctk.CTkFrame(jobs_card, fg_color="transparent")
-        self._jobs_frame.pack(fill="x", padx=12, pady=(0, 12))
         self._refresh_jobs_ui()
+        if self._enabled:
+            self._check_timer.start(60000)
 
-        # Note
-        note = self._card(body, row=3, title=t('note'))
-        ctk.CTkLabel(note, text=t('sched_note'),
-                     font=("Helvetica", 11), text_color=TEXT_SUB,
-                     justify="left").pack(anchor="w", padx=16, pady=(0, 12))
+    def _build_status_card(self):
+        c   = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+        lay.addWidget(section_title("Scheduler Status"))
 
-    def _card(self, parent, row, title):
-        f = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=10,
-                         border_width=1, border_color=BORDER)
-        f.grid(row=row, column=0, sticky="ew", padx=24, pady=(0, 14))
-        ctk.CTkLabel(f, text=title,
-                     font=("Helvetica", 13, "bold"),
-                     text_color=TEXT_MAIN).pack(anchor="w", padx=16, pady=(12, 4))
-        ctk.CTkFrame(f, height=1, fg_color=BORDER).pack(fill="x", padx=16, pady=(0, 8))
-        return f
+        self.status_lbl = QLabel("Scheduler is ON" if self._enabled else "Scheduler is OFF")
+        self.status_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.status_lbl.setStyleSheet(f"color: {'#2e7d32' if self._enabled else TEXT_SUB};")
+        lay.addWidget(self.status_lbl)
 
-    # ── Jobs ─────────────────────────────────────────────────
+        self.next_run_lbl = QLabel("Next run: —")
+        self.next_run_lbl.setFont(QFont("Segoe UI", 9))
+        self.next_run_lbl.setStyleSheet(f"color: {TEXT_SUB};")
+        lay.addWidget(self.next_run_lbl)
+
+        self.btn_toggle = success_btn(
+            "Disable Scheduler" if self._enabled else "Enable Scheduler")
+        self.btn_toggle.setFixedWidth(180)
+        self.btn_toggle.clicked.connect(self._toggle_scheduler)
+        lay.addWidget(self.btn_toggle)
+        return c
+
+    def _build_add_job_card(self):
+        c   = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(12)
+        lay.addWidget(section_title("Add Scheduled Run"))
+
+        # Days row
+        days_row = QHBoxLayout()
+        days_lbl = QLabel("Days of week:")
+        days_lbl.setFont(QFont("Segoe UI", 9))
+        days_lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        days_row.addWidget(days_lbl)
+        self._day_checks = {}
+        for day in DAYS:
+            cb = QCheckBox(day)
+            cb.setFont(QFont("Segoe UI", 9))
+            cb.setStyleSheet(f"""
+                QCheckBox {{ color: {TEXT_MAIN}; spacing: 4px; }}
+                QCheckBox::indicator {{
+                    width: 16px; height: 16px; border-radius: 3px;
+                    border: 2px solid #c0c8d8; background: white;
+                }}
+                QCheckBox::indicator:checked {{
+                    background: {ACCENT}; border-color: {ACCENT};
+                }}
+            """)
+            self._day_checks[day] = cb
+            days_row.addWidget(cb)
+        days_row.addStretch()
+        lay.addLayout(days_row)
+
+        # Time row
+        time_row = QHBoxLayout()
+        time_lbl = QLabel("Time (HH:MM):")
+        time_lbl.setFont(QFont("Segoe UI", 9))
+        time_lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        time_row.addWidget(time_lbl)
+        self.hour_edit = QLineEdit("09")
+        self.hour_edit.setFixedSize(52, 32)
+        self.hour_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hour_edit.setStyleSheet(self._input_style())
+        colon = QLabel(":")
+        colon.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self.min_edit = QLineEdit("00")
+        self.min_edit.setFixedSize(52, 32)
+        self.min_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.min_edit.setStyleSheet(self._input_style())
+        time_row.addWidget(self.hour_edit)
+        time_row.addWidget(colon)
+        time_row.addWidget(self.min_edit)
+        time_row.addStretch()
+        lay.addLayout(time_row)
+
+        # Label row
+        label_row = QHBoxLayout()
+        label_lbl = QLabel("Label (optional):")
+        label_lbl.setFont(QFont("Segoe UI", 9))
+        label_lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        label_row.addWidget(label_lbl)
+        self.label_edit = QLineEdit()
+        self.label_edit.setFixedHeight(32)
+        self.label_edit.setPlaceholderText("e.g. Morning warmup")
+        self.label_edit.setStyleSheet(self._input_style())
+        label_row.addWidget(self.label_edit, 1)
+        lay.addLayout(label_row)
+
+        btn_add = primary_btn("Add Job")
+        btn_add.setFixedWidth(100)
+        btn_add.clicked.connect(self._add_job)
+        lay.addWidget(btn_add)
+        return c
+
+    def _build_note_card(self):
+        c   = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setSpacing(4)
+        lay.addWidget(section_title("Note"))
+        for line in [
+            "The scheduler runs while WarmUpPro is open.",
+            "Use Windows Task Scheduler to auto-launch WarmUpPro at startup",
+            "if you need fully unattended scheduling.",
+        ]:
+            lbl = QLabel(line)
+            lbl.setFont(QFont("Segoe UI", 9))
+            lbl.setStyleSheet(f"color: {TEXT_SUB};")
+            lay.addWidget(lbl)
+        return c
+
+    def _input_style(self):
+        return f"""
+            QLineEdit {{
+                border: 1px solid {BORDER}; border-radius: 5px;
+                background: white; font-family: 'Segoe UI'; font-size: 10pt;
+                padding: 0 8px; color: {TEXT_MAIN};
+            }}
+            QLineEdit:focus {{ border-color: {ACCENT}; }}
+        """
+
+    # ── Logic ─────────────────────────────────────────────────────────────
+    def _toggle_scheduler(self):
+        self._enabled = not self._enabled
+        self.status_lbl.setText(
+            "Scheduler is ON" if self._enabled else "Scheduler is OFF")
+        self.status_lbl.setStyleSheet(
+            f"color: {'#2e7d32' if self._enabled else TEXT_SUB};")
+        self.btn_toggle.setText(
+            "Disable Scheduler" if self._enabled else "Enable Scheduler")
+        if self._enabled:
+            self._check_timer.start(60000)
+            self._update_next_run()
+        else:
+            self._check_timer.stop()
+            self.next_run_lbl.setText("Next run: —")
+        self._save_jobs()
+
     def _add_job(self):
-        days = [d for d, v in self._day_vars.items() if v.get()]
+        days = [d for d, cb in self._day_checks.items() if cb.isChecked()]
         if not days:
-            messagebox.showwarning("WarmUpPro", t('warn_select_day'))
+            QMessageBox.warning(self, "No days", "Select at least one day.")
             return
         try:
-            hour   = int(self._hour_var.get())
-            minute = int(self._min_var.get())
-            assert 0 <= hour < 24 and 0 <= minute < 60
+            h = int(self.hour_edit.text())
+            m = int(self.min_edit.text())
+            assert 0 <= h <= 23 and 0 <= m <= 59
         except Exception:
-            messagebox.showwarning("WarmUpPro", t('warn_invalid_time'))
+            QMessageBox.warning(self, "Invalid time", "Enter valid HH:MM (e.g. 09:30).")
             return
-        days_short = t('days_short')
-        days_abbr  = [days_short[DAYS_EN.index(d)] for d in days]
-        label = (self._label_var.get().strip() or
-                 f"{', '.join(days_abbr)} {hour:02d}:{minute:02d}")
-        self._jobs.append({"days": days, "hour": hour, "minute": minute, "label": label})
+        job = {
+            "days":  days,
+            "time":  f"{h:02d}:{m:02d}",
+            "label": self.label_edit.text().strip(),
+        }
+        self._jobs.append(job)
+        self._save_jobs()
         self._refresh_jobs_ui()
+        self.label_edit.clear()
+        if self._enabled:
+            self._update_next_run()
 
-    def _refresh_jobs_ui(self):
-        for widget in self._jobs_frame.winfo_children():
-            widget.destroy()
-        if not self._jobs:
-            ctk.CTkLabel(self._jobs_frame, text=t('no_jobs'),
-                         font=("Helvetica", 12), text_color=TEXT_SUB).pack(
-                anchor="w", padx=4, pady=8)
-            return
-        days_short = t('days_short')
-        for i, job in enumerate(self._jobs):
-            row = ctk.CTkFrame(self._jobs_frame, fg_color=CT_BG, corner_radius=6)
-            row.pack(fill="x", pady=2, padx=4)
-            abbrs = [days_short[DAYS_EN.index(d)] for d in job["days"]
-                     if d in DAYS_EN]
-            days_str = ", ".join(abbrs)
-            ctk.CTkLabel(row,
-                         text=f"{job['label']}  |  {days_str}  {job['hour']:02d}:{job['minute']:02d}",
-                         font=("Helvetica", 12), text_color=TEXT_MAIN).pack(
-                side="left", padx=10, pady=6)
-            ctk.CTkButton(row, text=t('remove'), width=80, height=26,
-                          font=("Helvetica", 11), fg_color=ERROR,
-                          command=lambda idx=i: self._remove_job(idx)).pack(
-                side="right", padx=8, pady=4)
-
-    def _remove_job(self, idx):
+    def _delete_job(self, idx):
         if 0 <= idx < len(self._jobs):
             self._jobs.pop(idx)
+            self._save_jobs()
             self._refresh_jobs_ui()
+            if self._enabled:
+                self._update_next_run()
 
-    # ── Scheduler toggle ─────────────────────────────────────
-    def _toggle_scheduler(self):
-        if self._sched_thread and self._sched_thread.is_alive():
-            self._stop_event.set()
-            self._sched_status.configure(text=t('sched_off'), text_color=TEXT_SUB)
-            self._next_lbl.configure(text=t('next_run_dash'))
-            self._toggle_btn.configure(text=t('enable_sched'),
-                                        fg_color=SUCCESS, hover_color="#16a34a")
-        else:
-            if not self._jobs:
-                messagebox.showwarning("WarmUpPro", t('warn_add_job_first'))
-                return
-            self._stop_event.clear()
-            self._sched_thread = threading.Thread(
-                target=self._scheduler_loop, daemon=True)
-            self._sched_thread.start()
-            self._sched_status.configure(text=t('sched_on'), text_color=SUCCESS)
-            self._toggle_btn.configure(text=t('disable_sched'),
-                                        fg_color=ERROR, hover_color="#dc2626")
-            self._update_next_run()
+    def _refresh_jobs_ui(self):
+        while self.jobs_container.count():
+            item = self.jobs_container.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-    def _scheduler_loop(self):
-        while not self._stop_event.is_set():
-            now = datetime.datetime.now()
-            for job in self._jobs:
-                if (now.strftime("%A") in job["days"]
-                        and now.hour == job["hour"]
-                        and now.minute == job["minute"]
-                        and now.second == 0):
-                    self.after(0, self._trigger_session)
-            self._stop_event.wait(timeout=30)
-            self.after(0, self._update_next_run)
+        if not self._jobs:
+            lbl = QLabel("No jobs scheduled.")
+            lbl.setFont(QFont("Segoe UI", 9))
+            lbl.setStyleSheet(f"color: {TEXT_SUB};")
+            self.jobs_container.addWidget(lbl)
+            return
 
-    def _trigger_session(self):
-        run_tab = self.app._tabs.get("run")
-        if run_tab and not self.app.session_mgr.is_running():
-            run_tab._start_session()
+        for i, job in enumerate(self._jobs):
+            row = QFrame()
+            row.setStyleSheet(f"""
+                QFrame {{
+                    background: #f4f6fa; border: 1px solid {BORDER}; border-radius: 6px;
+                }}
+            """)
+            rlay = QHBoxLayout(row)
+            rlay.setContentsMargins(12, 8, 12, 8)
+            days_str = ", ".join(job.get("days", []))
+            label    = job.get("label", "")
+            text     = f"{job['time']}  —  {days_str}"
+            if label:
+                text += f"  |  {label}"
+            lbl = QLabel(text)
+            lbl.setFont(QFont("Segoe UI", 9))
+            lbl.setStyleSheet(f"color: {TEXT_MAIN}; border: none; background: none;")
+            rlay.addWidget(lbl, 1)
+            btn_del = danger_btn("Remove")
+            btn_del.setFixedWidth(80)
+            btn_del.setFixedHeight(28)
+            btn_del.clicked.connect(lambda _, idx=i: self._delete_job(idx))
+            rlay.addWidget(btn_del)
+            self.jobs_container.addWidget(row)
+
+    def _check_schedule(self):
+        from datetime import datetime
+        now      = datetime.now()
+        day_name = DAYS[now.weekday()]
+        cur_time = f"{now.hour:02d}:{now.minute:02d}"
+        for job in self._jobs:
+            if day_name in job.get("days", []) and job.get("time") == cur_time:
+                try:
+                    self.main_window.tab_run.btn_start.click()
+                except Exception:
+                    pass
+                break
 
     def _update_next_run(self):
-        if not self._jobs or (self._sched_thread and not self._sched_thread.is_alive()):
+        from datetime import datetime, timedelta
+        if not self._jobs or not self._enabled:
+            self.next_run_lbl.setText("Next run: —")
             return
-        now = datetime.datetime.now()
+        now      = datetime.now()
         earliest = None
         for job in self._jobs:
-            for delta in range(7):
-                candidate = now + datetime.timedelta(days=delta)
-                if candidate.strftime("%A") in job["days"]:
-                    cand_t = candidate.replace(hour=job["hour"], minute=job["minute"],
-                                               second=0, microsecond=0)
-                    if cand_t > now:
-                        if earliest is None or cand_t < earliest:
-                            earliest = cand_t
-                        break
+            h, m = map(int, job["time"].split(":"))
+            for offset in range(7):
+                candidate = (now + timedelta(days=offset)).replace(
+                    hour=h, minute=m, second=0, microsecond=0)
+                if candidate > now and DAYS[candidate.weekday()] in job.get("days", []):
+                    if earliest is None or candidate < earliest:
+                        earliest = candidate
+                    break
         if earliest:
-            self._next_lbl.configure(
-                text=t('next_run_prefix') + earliest.strftime('%A %d %b %H:%M'))
-
-    def on_show(self):
-        pass
-
-    # ── Language update ──────────────────────────────────────
-    def update_lang(self):
-        was_running = self._sched_thread and self._sched_thread.is_alive()
-        for w in self.winfo_children():
-            w.destroy()
-        self._build()
-        if was_running:
-            self._sched_status.configure(text=t('sched_on'), text_color=SUCCESS)
-            self._toggle_btn.configure(text=t('disable_sched'),
-                                        fg_color=ERROR, hover_color="#dc2626")
-            self._update_next_run()
+            self.next_run_lbl.setText(
+                f"Next run: {earliest.strftime('%A, %d %b at %H:%M')}")
+        else:
+            self.next_run_lbl.setText("Next run: —")
