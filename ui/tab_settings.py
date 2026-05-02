@@ -1,311 +1,263 @@
 import os
-import customtkinter as ctk
-from tkinter import filedialog
+import glob
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QFileDialog, QMessageBox, QScrollArea, QFrame
+)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 
-class SettingsTab(ctk.CTkFrame):
-    def __init__(self, master, settings):
-        super().__init__(master)
-        self.settings = settings
+from ui.styles import (
+    page_title, card, section_title, styled_checkbox,
+    styled_slider, success_btn, secondary_btn,
+    BG_PAGE, ACCENT, TEXT_SUB, TEXT_MAIN, BORDER
+)
 
-        # Accent color (пока константа, потом можно привязать к Windows accent)
-        self.accent_color = "#6750A4"
-        self.error_color = "#B3261E"
-        self.ok_color = "#1B873F"
 
+class SettingsTab(QWidget):
+    def __init__(self, settings, main_window):
+        super().__init__()
+        self.settings    = settings
+        self.main_window = main_window
+        self.setStyleSheet(f"background: {BG_PAGE};")
         self._build_ui()
-        self._load_settings()
+        self._load_into_ui()
 
     def _build_ui(self):
-        # Главный контейнер
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"background: {BG_PAGE};")
 
-        # Карточка настроек (Elevated Material 3)
-        self.settings_card = ctk.CTkFrame(self, corner_radius=16)
-        self.settings_card.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
-        self.settings_card.grid_columnconfigure(0, weight=1)
-        self.settings_card.grid_columnconfigure(1, weight=0)
+        content = QWidget()
+        content.setStyleSheet(f"background: {BG_PAGE};")
+        vbox = QVBoxLayout(content)
+        vbox.setContentsMargins(28, 24, 28, 24)
+        vbox.setSpacing(16)
 
-        # Заголовок
-        self.title_label = ctk.CTkLabel(
-            self.settings_card,
-            text="Settings",
-            font=("Segoe UI Variable", 20, "bold")
-        )
-        self.title_label.grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(16, 12))
+        vbox.addWidget(page_title("Settings"))
+        vbox.addWidget(self._build_paths_card())
+        vbox.addWidget(self._build_browser_options_card())
+        vbox.addWidget(self._build_session_gap_card())
+        vbox.addWidget(self._build_reading_speed_card())
+        vbox.addStretch()
 
-        row = 1
+        btn_save = success_btn("Save All Settings")
+        btn_save.setFixedWidth(180)
+        btn_save.clicked.connect(self._save)
+        vbox.addWidget(btn_save)
 
-        # Firefox binary
-        self._add_labeled_entry(
-            parent=self.settings_card,
-            row=row,
-            label_text="Firefox binary",
-            attr_name="firefox_entry",
-            browse_command=self.browse_firefox
-        )
-        row += 1
+        scroll.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
-        # Firefox profile
-        self._add_labeled_entry(
-            parent=self.settings_card,
-            row=row,
-            label_text="Firefox profile",
-            attr_name="profile_entry",
-            browse_command=self.browse_profile
-        )
-        row += 1
+    def _build_paths_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(12)
+        lay.addWidget(section_title("Firefox & Geckodriver Paths"))
 
-        # Geckodriver path
-        self._add_labeled_entry(
-            parent=self.settings_card,
-            row=row,
-            label_text="Geckodriver path",
-            attr_name="gecko_entry",
-            browse_command=self.browse_gecko
-        )
-        row += 1
+        self.edit_binary  = self._path_row(lay, "Firefox binary (.exe)")
+        self.edit_profile = self._path_row(lay, "Firefox profile folder", folder=True)
+        self.edit_gecko   = self._path_row(lay, "Geckodriver (.exe)")
 
-        # Auto-close browser
-        self.auto_close_var = ctk.BooleanVar(value=True)
-        self.auto_close_checkbox = ctk.CTkCheckBox(
-            self.settings_card,
-            text="Auto-close browser",
-            variable=self.auto_close_var,
-            fg_color=self.accent_color
-        )
-        self.auto_close_checkbox.grid(row=row, column=0, columnspan=2, sticky="w", padx=20, pady=(12, 4))
-        row += 1
+        btn_row = QHBoxLayout()
+        btn_autodetect = secondary_btn("Auto-detect geckodriver")
+        btn_autodetect.clicked.connect(self._autodetect_gecko)
+        btn_autoprofile = secondary_btn("Auto-detect profile")
+        btn_autoprofile.clicked.connect(self._autodetect_profile)
+        btn_test = success_btn("Test paths")
+        btn_test.setFixedWidth(110)
+        btn_test.clicked.connect(self._test_paths)
+        btn_row.addWidget(btn_autodetect)
+        btn_row.addWidget(btn_autoprofile)
+        btn_row.addWidget(btn_test)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
 
-        # Auto-detect button
-        self.auto_detect_button = ctk.CTkButton(
-            self.settings_card,
-            text="Auto-detect",
-            fg_color=self.accent_color,
-            command=self.auto_detect,
-            height=32
-        )
-        self.auto_detect_button.grid(row=row, column=0, sticky="w", padx=20, pady=(8, 16))
-        row += 1
+        self.test_result_lbl = QLabel("")
+        self.test_result_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.test_result_lbl.setWordWrap(True)
+        lay.addWidget(self.test_result_lbl)
+        return c
 
-        # Карточка проверки путей
-        self.check_card = ctk.CTkFrame(self, corner_radius=16)
-        self.check_card.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="ew")
-        self.check_card.grid_columnconfigure(0, weight=0)
-        self.check_card.grid_columnconfigure(1, weight=1)
-        self.check_card.grid_columnconfigure(2, weight=0)
+    def _path_row(self, parent_layout, label, folder=False):
+        lbl = QLabel(label)
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        parent_layout.addWidget(lbl)
 
-        self.check_button = ctk.CTkButton(
-            self.check_card,
-            text="Check paths",
-            fg_color=self.accent_color,
-            command=self.check_paths,
-            height=32,
-            width=120
-        )
-        self.check_button.grid(row=0, column=0, padx=20, pady=(14, 6), sticky="w")
+        row = QHBoxLayout()
+        edit = QLineEdit()
+        edit.setFixedHeight(32)
+        edit.setStyleSheet(f"""
+            QLineEdit {{
+                border: 1px solid {BORDER}; border-radius: 5px;
+                background: white; font-family: 'Segoe UI'; font-size: 9pt;
+                padding: 0 10px; color: {TEXT_MAIN};
+            }}
+            QLineEdit:focus {{ border-color: {ACCENT}; }}
+        """)
+        btn = secondary_btn("Browse...")
+        btn.setFixedWidth(90)
+        btn.setFixedHeight(32)
+        btn.clicked.connect(lambda _, e=edit, f=folder: self._browse(e, f))
+        row.addWidget(edit, 1)
+        row.addWidget(btn)
+        parent_layout.addLayout(row)
+        return edit
 
-        # Чип OK / Not OK
-        self.status_chip = ctk.CTkLabel(
-            self.check_card,
-            text="",
-            fg_color="transparent",
-            corner_radius=999,
-            font=("Segoe UI Variable", 13, "bold")
-        )
-        self.status_chip.grid(row=0, column=2, padx=20, pady=(14, 6), sticky="e")
+    def _build_browser_options_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+        lay.addWidget(section_title("Browser Options"))
 
-        # Лог проверки
-        self.result_label = ctk.CTkLabel(
-            self.check_card,
-            text="",
-            font=("Segoe UI Variable", 13),
-            justify="left"
-        )
-        self.result_label.grid(row=1, column=0, columnspan=3, padx=20, pady=(0, 14), sticky="w")
+        self.cb_close = styled_checkbox("Close browser after session")
+        self.cb_retry = styled_checkbox("Retry crashed phases")
+        self.cb_close.setChecked(True)
+        self.cb_retry.setChecked(True)
+        lay.addWidget(self.cb_close)
+        lay.addWidget(self.cb_retry)
+        self.sl_retries = self._slider_row(lay, "Max retries per phase", 1, 10, 1)
+        return c
 
-        # Флаг анимации
-        self._checking = False
+    def _build_session_gap_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+        lay.addWidget(section_title("Session Gap"))
+        self.sl_gap = self._slider_row(lay, "Min gap between sessions (min)", 0, 60, 1)
+        return c
 
-    def _add_labeled_entry(self, parent, row, label_text, attr_name, browse_command):
-        label = ctk.CTkLabel(parent, text=label_text)
-        label.grid(row=row, column=0, sticky="w", padx=20, pady=(8, 0))
+    def _build_reading_speed_card(self):
+        c = card()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+        lay.addWidget(section_title("Reading Speed"))
 
-        entry = ctk.CTkEntry(parent, width=420)
-        entry.grid(row=row + 1, column=0, sticky="we", padx=20, pady=(4, 8))
+        row = QHBoxLayout()
+        lbl = QLabel("Read speed (0=fast, 1=slow):")
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        lbl.setFixedWidth(220)
+        self.sl_read = styled_slider(0, 100, 70)
+        self.val_read = QLabel("0.7")
+        self.val_read.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.val_read.setStyleSheet(f"color: {ACCENT}; min-width: 32px;")
+        self.sl_read.valueChanged.connect(
+            lambda v: self.val_read.setText(f"{v/100:.1f}"))
+        row.addWidget(lbl)
+        row.addWidget(self.sl_read, 1)
+        row.addWidget(self.val_read)
+        lay.addLayout(row)
+        return c
 
-        browse_button = ctk.CTkButton(
-            parent,
-            text="Browse",
-            width=90,
-            height=32,
-            fg_color=self.accent_color,
-            command=browse_command
-        )
-        browse_button.grid(row=row + 1, column=1, sticky="e", padx=(0, 20), pady=(4, 8))
+    def _slider_row(self, parent_layout, label, min_v, max_v, default):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet(f"color: {TEXT_MAIN};")
+        lbl.setFixedWidth(220)
+        sl = styled_slider(min_v, max_v, default)
+        val_lbl = QLabel(str(default))
+        val_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        val_lbl.setStyleSheet(f"color: {ACCENT}; min-width: 28px;")
+        sl.valueChanged.connect(lambda v, l=val_lbl: l.setText(str(v)))
+        row.addWidget(lbl)
+        row.addWidget(sl, 1)
+        row.addWidget(val_lbl)
+        parent_layout.addLayout(row)
+        return sl
 
-        setattr(self, attr_name, entry)
-
-    # ====== LOAD / SAVE ======
-
-    def _load_settings(self):
-        # если у тебя есть settings dict/объект — подставь реальные ключи
-        self.firefox_entry.insert(0, self.settings.get("firefox_binary", ""))
-        self.profile_entry.insert(0, self.settings.get("firefox_profile", ""))
-        self.gecko_entry.insert(0, self.settings.get("geckodriver_path", ""))
-        self.auto_close_var.set(self.settings.get("auto_close_browser", True))
-
-    def save_settings(self):
-        self.settings["firefox_binary"] = self.firefox_entry.get()
-        self.settings["firefox_profile"] = self.profile_entry.get()
-        self.settings["geckodriver_path"] = self.gecko_entry.get()
-        self.settings["auto_close_browser"] = self.auto_close_var.get()
-
-    # ====== BROWSE ======
-
-    def browse_firefox(self):
-        path = filedialog.askopenfilename(title="Select Firefox binary")
+    def _browse(self, edit_widget, folder=False):
+        if folder:
+            path = QFileDialog.getExistingDirectory(self, "Select folder")
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select file", "", "Executables (*.exe);;All files (*.*)")
         if path:
-            self.firefox_entry.delete(0, "end")
-            self.firefox_entry.insert(0, path)
+            edit_widget.setText(path)
 
-    def browse_profile(self):
-        path = filedialog.askdirectory(title="Select Firefox profile folder")
-        if path:
-            self.profile_entry.delete(0, "end")
-            self.profile_entry.insert(0, path)
-
-    def browse_gecko(self):
-        path = filedialog.askopenfilename(title="Select Geckodriver executable")
-        if path:
-            self.gecko_entry.delete(0, "end")
-            self.gecko_entry.insert(0, path)
-
-    # ====== AUTO-DETECT / AUTO-FIX ======
-
-    def auto_detect(self):
-        changed = False
-
-        possible_firefox = [
-            r"C:\Program Files\Mozilla Firefox\firefox.exe",
-            r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
+    def _autodetect_gecko(self):
+        base = Path(__file__).resolve().parent.parent
+        candidates = [
+            base / "drivers" / "geckodriver.exe",
+            base / "geckodriver.exe",
         ]
-        if not os.path.exists(self.firefox_entry.get()):
-            for path in possible_firefox:
-                if os.path.exists(path):
-                    self.firefox_entry.delete(0, "end")
-                    self.firefox_entry.insert(0, path)
-                    changed = True
-                    break
+        for c in candidates:
+            if c.exists():
+                self.edit_gecko.setText(str(c))
+                return
+        QMessageBox.information(self, "Not found",
+            "geckodriver.exe not found. Place it in the drivers/ folder.")
 
-        possible_gecko = [
-            r"Q:\warmup_new\drivers\geckodriver.exe",
-            r"C:\tools\geckodriver.exe"
+    def _autodetect_profile(self):
+        patterns = [
+            os.path.expandvars(r"%APPDATA%\Mozilla\Firefox\Profiles\*.default-release"),
+            os.path.expandvars(r"%APPDATA%\Mozilla\Firefox\Profiles\*.default"),
+            os.path.expandvars(r"%APPDATA%\Mozilla\Firefox\Profiles\*"),
         ]
-        if not os.path.exists(self.gecko_entry.get()):
-            for path in possible_gecko:
-                if os.path.exists(path):
-                    self.gecko_entry.delete(0, "end")
-                    self.gecko_entry.insert(0, path)
-                    changed = True
-                    break
+        for pattern in patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                self.edit_profile.setText(matches[0])
+                return
+        QMessageBox.information(self, "Not found",
+            "Firefox profile not found. Set path manually.")
 
-        if changed:
-            self.result_label.configure(text="Auto-detect: some paths were updated ✅", text_color=self.ok_color)
+    def _test_paths(self):
+        binary  = self.edit_binary.text().strip()
+        profile = self.edit_profile.text().strip()
+        gecko   = self.edit_gecko.text().strip()
+        errors = []
+        if not os.path.exists(binary):  errors.append("Firefox binary not found")
+        if not os.path.exists(profile): errors.append("Firefox profile not found")
+        if not os.path.exists(gecko):   errors.append("Geckodriver not found")
+
+        if errors:
+            self.test_result_lbl.setText("❌  " + "  |  ".join(errors))
+            self.test_result_lbl.setStyleSheet("color: #c62828; font-weight: bold;")
         else:
-            self.result_label.configure(text="Auto-detect: nothing changed", text_color=self.error_color)
+            self.test_result_lbl.setText("✅  All paths configured correctly.")
+            self.test_result_lbl.setStyleSheet("color: #2e7d32; font-weight: bold;")
 
-    def auto_fix_paths(self, missing):
-        """
-        missing: dict с флагами, что не найдено
-        """
-        fixed = False
+    def _load_into_ui(self):
+        try:
+            self.edit_binary.setText(self.settings.get("firefox_binary", ""))
+            self.edit_profile.setText(self.settings.get("firefox_profile", ""))
+            self.edit_gecko.setText(self.settings.get("geckodriver", ""))
+            self.cb_close.setChecked(self.settings.get("close_after_session", True))
+            self.cb_retry.setChecked(self.settings.get("retry_crashes", True))
+            self.sl_retries.setValue(self.settings.get("max_retries", 1))
+            self.sl_gap.setValue(self.settings.get("session_gap_min", 1))
+            speed = self.settings.get("read_speed", 0.7)
+            self.sl_read.setValue(int(float(speed) * 100))
+        except Exception:
+            pass
 
-        if missing.get("firefox"):
-            self.auto_detect()  # пробуем через auto_detect
-            fixed = True
-
-        if missing.get("gecko"):
-            self.auto_detect()
-            fixed = True
-
-        if missing.get("profile"):
-            # если профиль не найден — предлагаем выбрать
-            path = filedialog.askdirectory(title="Select Firefox profile folder")
-            if path:
-                self.profile_entry.delete(0, "end")
-                self.profile_entry.insert(0, path)
-                fixed = True
-
-        if fixed:
-            self.result_label.configure(text="Auto-fix applied. Run check again.", text_color=self.ok_color)
-        else:
-            self.result_label.configure(text="Auto-fix could not resolve all issues.", text_color=self.error_color)
-
-    # ====== CHECK PATHS + АНИМАЦИЯ ======
-
-    def check_paths(self):
-        if self._checking:
-            return
-
-        self._checking = True
-        self.check_button.configure(state="disabled", text="Checking…")
-        self.status_chip.configure(text="", fg_color="transparent")
-        self.result_label.configure(text="", text_color=None)
-
-        # имитация анимации/задержки проверки
-        self.after(600, self._finish_check_paths)
-
-    def _finish_check_paths(self):
-        self._checking = False
-        self.check_button.configure(state="normal", text="Check paths")
-
-        results = []
-        ok = True
-        missing = {"firefox": False, "profile": False, "gecko": False}
-
-        firefox_path = self.firefox_entry.get().strip()
-        profile_path = self.profile_entry.get().strip()
-        gecko_path = self.gecko_entry.get().strip()
-
-        if os.path.exists(firefox_path):
-            results.append("Firefox binary: OK ✅")
-        else:
-            results.append("Firefox binary: Not found ❌")
-            ok = False
-            missing["firefox"] = True
-
-        if os.path.exists(profile_path):
-            results.append("Firefox profile: OK ✅")
-        else:
-            results.append("Firefox profile: Not found ❌")
-            ok = False
-            missing["profile"] = True
-
-        if os.path.exists(gecko_path):
-            results.append("Geckodriver: OK ✅")
-        else:
-            results.append("Geckodriver: Not found ❌")
-            ok = False
-            missing["gecko"] = True
-
-        if ok:
-            self.status_chip.configure(
-                text="OK",
-                fg_color=self.ok_color,
-                text_color="white",
-                padx=14,
-                pady=4
-            )
-            self.result_label.configure(text="\n".join(results), text_color=self.ok_color)
-        else:
-            self.status_chip.configure(
-                text="Not OK",
-                fg_color=self.error_color,
-                text_color="white",
-                padx=14,
-                pady=4
-            )
-            self.result_label.configure(text="\n".join(results), text_color=self.error_color)
-            # авто‑фиксация
-            self.auto_fix_paths(missing)
+    def _save(self):
+        try:
+            self.settings.set("firefox_binary",      self.edit_binary.text().strip())
+            self.settings.set("firefox_profile",     self.edit_profile.text().strip())
+            self.settings.set("geckodriver",          self.edit_gecko.text().strip())
+            self.settings.set("close_after_session",  self.cb_close.isChecked())
+            self.settings.set("retry_crashes",        self.cb_retry.isChecked())
+            self.settings.set("max_retries",          self.sl_retries.value())
+            self.settings.set("session_gap_min",      self.sl_gap.value())
+            self.settings.set("read_speed",           self.sl_read.value() / 100.0)
+            self.settings.save_all()
+            QMessageBox.information(self, "Saved", "Settings saved successfully.")
+            try:
+                self.main_window.tab_run._check_firefox()
+                self.main_window.tab_amazon._check_firefox()
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
