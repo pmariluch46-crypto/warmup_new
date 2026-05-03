@@ -11,7 +11,7 @@ Session flow:
          deep  (20%) : 3-7 min  - images -> description -> reviews -> review photos -> add to cart
          medium(50%) : 30s-2min - images + scrolling -> close
          quick (30%) : 20-40s  - quick glance -> close
-    6. After all tabs closed -> stay on Amazon -> search next product in Amazon search bar
+    6. After all tabs closed -> stay on Amazon -> search next product via ON-PAGE search bar
     7. Repeat steps 3-6 for a "stint":
          - SHORT stint : 15-18 min
          - LONG  stint : 20-30 min
@@ -22,6 +22,13 @@ Cart rule:
   - Max 4 items at any time
   - Before adding: check cart count -> while count >= 4 -> delete the very first/oldest item
   - Works regardless of how many items are manually in cart
+
+KEY FIX (v2):
+  - Mouse NEVER goes to browser address bar.
+  - All Amazon searches use the ON-PAGE search input (#twotabsearchtextbox).
+  - The input is activated via JS focus + Selenium send_keys, no pyautogui keyboard.
+  - pyautogui is used ONLY for Ctrl+Click product links (viewport coordinates only,
+    clamped away from the top browser chrome).
 """
 
 import time
@@ -138,7 +145,7 @@ def _get_cart_count(driver) -> int:
         return 0
 
 def _open_cart(driver):
-    """Navigate to the cart page."""
+    """Navigate to the cart page using on-page nav link only (no address bar)."""
     try:
         cart_link = driver.find_element(By.CSS_SELECTOR, "#nav-cart")
         bot.human_click(driver, cart_link)
@@ -146,7 +153,10 @@ def _open_cart(driver):
         bot.inject_stealth(driver)
     except Exception:
         try:
-            driver.get("https://www.amazon.com/gp/cart/view.html")
+            # JS navigation — avoids touching the address bar
+            driver.execute_script(
+                "window.location.href = 'https://www.amazon.com/gp/cart/view.html';"
+            )
             bot.ln_sleep(random.uniform(2.0, 3.0), 0.22)
             bot.inject_stealth(driver)
         except Exception:
@@ -183,7 +193,6 @@ def _ensure_cart_has_room(driver):
     """
     Ensure cart has fewer than 4 items.
     Keeps deleting the first/oldest item until count < 4.
-    Works even if user manually filled the cart with many items.
     """
     try:
         count = _get_cart_count(driver)
@@ -300,9 +309,7 @@ def _read_description(driver, stop_event):
         pass
 
 def _view_review_images(driver, stop_event):
-    """
-    Click and view customer review photos (the image strip under reviews).
-    """
+    """Click and view customer review photos (the image strip under reviews)."""
     try:
         img_selectors = [
             "[data-hook='review-image-tile'] img",
@@ -328,7 +335,6 @@ def _view_review_images(driver, stop_event):
             bot.mouse_move_to_element(driver, img)
             bot.ln_sleep(random.uniform(0.4, 1.0), 0.20)
             bot.human_click(driver, img)
-            # Look at the photo for a natural amount of time
             bot.ln_sleep(random.uniform(1.5, 4.0), 0.25)
 
             # Close lightbox if it opened
@@ -353,7 +359,6 @@ def _view_review_images(driver, stop_event):
 def _read_reviews(driver, stop_event):
     """Scroll to reviews, read a few, and view customer review photos."""
     try:
-        # Scroll to reviews section
         for sel in ["#reviewsMedley", "#customer-reviews-content",
                     "#reviews-medley-footer"]:
             try:
@@ -365,7 +370,6 @@ def _read_reviews(driver, stop_event):
             except Exception:
                 continue
 
-        # Read review bodies
         reviews = driver.find_elements(
             By.CSS_SELECTOR,
             "[data-hook='review'] [data-hook='review-body'] span, "
@@ -385,7 +389,6 @@ def _read_reviews(driver, stop_event):
                 bot.scroll_page(driver, random.randint(100, 280))
                 bot.ln_sleep(random.uniform(0.4, 1.0), 0.18)
 
-        # Check star rating histogram occasionally
         if random.random() < 0.4:
             try:
                 hist = driver.find_element(
@@ -396,7 +399,6 @@ def _read_reviews(driver, stop_event):
             except Exception:
                 pass
 
-        # View customer review photos (70% chance)
         if stop_event.is_set():
             return
         if random.random() < 0.70:
@@ -414,7 +416,7 @@ def _visit_deep(driver, cfg: AmazonSessionConfig):
     Deep visit: 3-7 minutes.
     images -> description -> reviews -> review photos -> add to cart
     """
-    stay_s = random.uniform(180, 420)  # 3-7 min
+    stay_s = random.uniform(180, 420)
     end_t  = time.time() + stay_s
 
     bot.inject_stealth(driver)
@@ -423,34 +425,28 @@ def _visit_deep(driver, cfg: AmazonSessionConfig):
     if cfg.stop_event.is_set():
         return
 
-    # Initial page glance
     bot.scroll_page(driver, random.randint(200, 500))
     bot.ln_sleep(random.uniform(0.8, 1.8), 0.22)
 
-    # 1. Product images
     _scroll_images(driver, cfg.stop_event)
     if cfg.stop_event.is_set():
         return
 
-    # 2. Description / bullets
     if time.time() < end_t:
         _read_description(driver, cfg.stop_event)
     if cfg.stop_event.is_set():
         return
 
-    # 3. Reviews + review photos
     if time.time() < end_t:
         _read_reviews(driver, cfg.stop_event)
     if cfg.stop_event.is_set():
         return
 
-    # 4. Add to cart
     if time.time() < end_t:
         _add_to_cart(driver)
     if cfg.stop_event.is_set():
         return
 
-    # 5. Fill remaining time with natural scrolling / mouse drift
     while time.time() < end_t and not cfg.stop_event.is_set():
         remaining = end_t - time.time()
         if remaining < 0.5:
@@ -534,7 +530,7 @@ def _visit_quick(driver, cfg: AmazonSessionConfig):
 
 def _assign_visit_types(tab_count: int) -> list:
     """
-    Randomly assign visit types to tab_count tabs UPFRONT before visiting any.
+    Randomly assign visit types upfront.
     20% deep, 50% medium, 30% quick.
     Guarantees at least 1 deep if tab_count >= 3.
     """
@@ -548,23 +544,44 @@ def _assign_visit_types(tab_count: int) -> list:
         else:
             types.append(VISIT_QUICK)
 
-    # Guarantee at least 1 deep visit if we have enough tabs
     if tab_count >= 3 and VISIT_DEEP not in types:
         types[random.randint(0, tab_count - 1)] = VISIT_DEEP
 
     return types
 
 # ==============================================================================
-# CTRL+CLICK HELPER
+# CTRL+CLICK HELPER  (FIX: clamp y so it never hits browser chrome/address bar)
 # ==============================================================================
 
+# Minimum Y offset in screen pixels below which we consider safe (browser
+# toolbars are typically 80-120 px tall; 150 px gives a safe buffer).
+_BROWSER_CHROME_HEIGHT_PX = 150
+
 def _ctrl_click_element(driver, element):
-    """Ctrl+Click an element to open its link in a new tab."""
+    """
+    Ctrl+Click an element to open its link in a new tab.
+    The Y coordinate is clamped so the click NEVER lands in the browser
+    address bar / toolbar area at the top of the screen.
+    """
     try:
+        # Scroll element into the middle of the viewport first
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            element
+        )
+        bot.ln_sleep(random.uniform(0.3, 0.7), 0.18)
+
         bot.mouse_move_to_element(driver, element)
         bot.ln_sleep(random.uniform(0.3, 0.8), 0.20)
+
         sx, sy = bot._element_screen_point(driver, element)
         sx, sy = bot._clamp_screen(sx, sy)
+
+        # ── KEY FIX: reject any point that lands in browser chrome ──────
+        if sy < _BROWSER_CHROME_HEIGHT_PX:
+            # Element is partially hidden behind toolbar — skip it
+            return
+
         pyautogui.keyDown('ctrl')
         time.sleep(random.uniform(0.05, 0.12))
         pyautogui.click(sx, sy)
@@ -575,50 +592,201 @@ def _ctrl_click_element(driver, element):
         pass
 
 # ==============================================================================
-# OPEN TABS FROM AMAZON PAGES
+# PRODUCT LINK COLLECTOR
 # ==============================================================================
 
-def _open_tabs_from_search_results(driver, stop_event) -> list:
+def _get_product_links_on_page(driver) -> list:
     """
-    From an Amazon search results page, Ctrl+Click 4-7 product thumbnails
-    to open them in new tabs.
-    Returns list of new tab handles.
+    Return all visible product link elements on the current Amazon search
+    results page. Multiple selectors for layout robustness.
     """
-    original_handles = set(driver.window_handles)
-    tab_count = random.randint(4, 7)
-
-    product_selectors = [
+    selectors = [
         "[data-component-type='s-search-result'] h2 a.a-link-normal",
         "[data-component-type='s-search-result'] a.a-link-normal[href*='/dp/']",
-        ".s-result-item h2 a",
+        ".s-result-item h2 a[href*='/dp/']",
+        ".s-card-container a.a-link-normal[href*='/dp/']",
     ]
-    candidates = []
-    for sel in product_selectors:
-        found = driver.find_elements(By.CSS_SELECTOR, sel)
-        candidates.extend([f for f in found if f.is_displayed()])
-        if len(candidates) >= 10:
-            break
+    seen_hrefs = set()
+    results = []
+    for sel in selectors:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                if not el.is_displayed():
+                    continue
+                href = el.get_attribute("href") or ""
+                if "/dp/" not in href or href in seen_hrefs:
+                    continue
+                seen_hrefs.add(href)
+                results.append(el)
+            except Exception:
+                pass
+    return results
 
-    # Scroll to reveal more
-    bot.scroll_page(driver, random.randint(200, 500))
-    bot.ln_sleep(random.uniform(0.6, 1.2), 0.20)
+# ==============================================================================
+# HUMAN BROWSE SEARCH RESULTS  (FIX: stays on page, no address bar)
+# ==============================================================================
 
-    candidates = []
-    for sel in product_selectors:
-        found = driver.find_elements(By.CSS_SELECTOR, sel)
-        candidates.extend([f for f in found if f.is_displayed()])
-        if len(candidates) >= 10:
-            break
+def _human_browse_search_results(driver, stop_event) -> list:
+    """
+    Behave like a real person browsing Amazon search results:
+      1. Scroll down page 1 in natural chunks, pausing to 'look' at products
+      2. Ctrl+Click 3-5 products from page 1 into new tabs
+      3. Click the on-page 'Next page' link to go to page 2
+      4. Scroll page 2 naturally
+      5. Ctrl+Click 1-3 more products from page 2
+    Returns list of all newly opened tab handles.
 
-    if not candidates:
+    NOTE: This function NEVER touches the browser address bar.
+          Page navigation uses the on-page pagination link only.
+    """
+    original_handles = set(driver.window_handles)
+
+    # ── PAGE 1 ────────────────────────────────────────────────────────────
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR,
+                 "[data-component-type='s-search-result']")))
+    except TimeoutException:
         return []
 
-    chosen = random.sample(candidates[:12], min(tab_count, len(candidates)))
-    for el in chosen:
+    # Brief pause — just landed, let the page settle
+    bot.ln_sleep(random.uniform(1.2, 2.8), 0.22)
+    bot.idle_mouse_drift(driver, random.uniform(0.8, 1.8))
+
+    # Scroll page 1 in human-like chunks
+    total_scroll = random.randint(1800, 3200)
+    scrolled     = 0
+    while scrolled < total_scroll and not stop_event.is_set():
+        chunk = random.randint(220, 520)
+        bot.scroll_page(driver, chunk)
+        scrolled += chunk
+        bot.ln_sleep(random.uniform(0.6, 2.2), 0.28)
+        # Occasionally hover mouse over a result card (stays in viewport)
+        if random.random() < 0.45:
+            links = _get_product_links_on_page(driver)
+            if links:
+                candidate = random.choice(links[:10])
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});",
+                        candidate)
+                    bot.mouse_move_to_element(driver, candidate)
+                    bot.ln_sleep(random.uniform(0.3, 1.0), 0.22)
+                except Exception:
+                    pass
+
+    if stop_event.is_set():
+        return []
+
+    # Collect all visible product links on page 1
+    page1_links = _get_product_links_on_page(driver)
+    if not page1_links:
+        return []
+
+    # Pick 3-5 to Ctrl+Click from page 1
+    # Bias toward links that appeared after scrolling (not just the top 2)
+    pool     = page1_links[2:] if len(page1_links) > 4 else page1_links
+    p1_count = random.randint(3, min(5, len(pool)))
+    p1_chosen = random.sample(pool[:14], min(p1_count, len(pool)))
+
+    for el in p1_chosen:
         if stop_event.is_set():
             break
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el)
+            bot.ln_sleep(random.uniform(0.5, 1.2), 0.22)
+        except Exception:
+            pass
         _ctrl_click_element(driver, el)
-        bot.ln_sleep(random.uniform(0.5, 1.2), 0.20)
+        bot.ln_sleep(random.uniform(0.8, 2.0), 0.22)
+
+    if stop_event.is_set():
+        return [h for h in driver.window_handles if h not in original_handles]
+
+    # ── PAGE 2  (on-page 'Next' link — never the address bar) ─────────────
+    try:
+        next_btn = None
+        next_selectors = [
+            "a.s-pagination-next",
+            "li.a-last a",
+            "a[aria-label='Go to next page']",
+            ".a-pagination .a-last a",
+            "a[aria-label='Next page']",
+        ]
+        for sel in next_selectors:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            visible = [e for e in els if e.is_displayed()]
+            if visible:
+                next_btn = visible[0]
+                break
+
+        if next_btn:
+            # Scroll the Next button into view and click it naturally
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", next_btn)
+            bot.ln_sleep(random.uniform(0.8, 1.8), 0.22)
+            bot.mouse_move_to_element(driver, next_btn)
+            bot.ln_sleep(random.uniform(0.4, 1.0), 0.20)
+            bot.human_click(driver, next_btn)
+            bot.ln_sleep(random.uniform(2.2, 3.8), 0.22)
+            bot.inject_stealth(driver)
+            bot._reset_mouse(driver)
+
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR,
+                         "[data-component-type='s-search-result']")))
+            except TimeoutException:
+                pass
+
+            bot.ln_sleep(random.uniform(1.0, 2.2), 0.22)
+
+            # Scroll page 2 naturally
+            p2_scroll   = random.randint(1000, 2400)
+            p2_scrolled = 0
+            while p2_scrolled < p2_scroll and not stop_event.is_set():
+                chunk = random.randint(200, 480)
+                bot.scroll_page(driver, chunk)
+                p2_scrolled += chunk
+                bot.ln_sleep(random.uniform(0.5, 1.8), 0.28)
+                if random.random() < 0.35:
+                    links = _get_product_links_on_page(driver)
+                    if links:
+                        candidate = random.choice(links[:8])
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({block:'center'});",
+                                candidate)
+                            bot.mouse_move_to_element(driver, candidate)
+                            bot.ln_sleep(random.uniform(0.3, 0.9), 0.20)
+                        except Exception:
+                            pass
+
+            if not stop_event.is_set():
+                page2_links = _get_product_links_on_page(driver)
+                if page2_links:
+                    p2_count  = random.randint(1, min(3, len(page2_links)))
+                    p2_chosen = random.sample(
+                        page2_links[:12], min(p2_count, len(page2_links)))
+
+                    for el in p2_chosen:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({block:'center'});",
+                                el)
+                            bot.ln_sleep(random.uniform(0.5, 1.2), 0.22)
+                        except Exception:
+                            pass
+                        _ctrl_click_element(driver, el)
+                        bot.ln_sleep(random.uniform(0.8, 2.0), 0.22)
+
+    except Exception:
+        pass  # Page 2 is best-effort; page-1 tabs are already open
 
     new_handles = [h for h in driver.window_handles
                    if h not in original_handles]
@@ -627,8 +795,8 @@ def _open_tabs_from_search_results(driver, stop_event) -> list:
 
 def _open_tabs_from_product_page(driver, stop_event) -> list:
     """
-    From an Amazon product page, Ctrl+Click 4-7 links from
-    'Similar items', 'Customers also bought', and search results carousels.
+    From an Amazon product page, Ctrl+Click links from
+    'Similar items', 'Customers also bought', and recommendation carousels.
     Returns list of new tab handles.
     """
     original_handles = set(driver.window_handles)
@@ -652,7 +820,6 @@ def _open_tabs_from_product_page(driver, stop_event) -> list:
         found = driver.find_elements(By.CSS_SELECTOR, sel)
         candidates.extend([f for f in found if f.is_displayed()])
 
-    # Deduplicate by href
     seen_hrefs = set()
     unique_candidates = []
     for el in candidates:
@@ -674,6 +841,12 @@ def _open_tabs_from_product_page(driver, stop_event) -> list:
     for el in chosen:
         if stop_event.is_set():
             break
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el)
+            bot.ln_sleep(random.uniform(0.4, 1.0), 0.20)
+        except Exception:
+            pass
         _ctrl_click_element(driver, el)
         bot.ln_sleep(random.uniform(0.5, 1.2), 0.20)
 
@@ -689,7 +862,7 @@ def _work_through_tabs(driver, tab_handles: list, visit_types: list,
                        cfg: AmazonSessionConfig, progress_fn):
     """
     Switch to each tab, perform assigned visit type, close the tab.
-    Returns to original tab when done.
+    Returns to the original (search results) tab when done.
     """
     original_handle = driver.current_window_handle
 
@@ -706,9 +879,8 @@ def _work_through_tabs(driver, tab_handles: list, visit_types: list,
         except Exception:
             continue
 
-        # Wait for page to load
         try:
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 12).until(
                 lambda d: d.execute_script(
                     "return document.readyState") == "complete")
         except Exception:
@@ -731,7 +903,6 @@ def _work_through_tabs(driver, tab_handles: list, visit_types: list,
         if cfg.stop_event.is_set():
             break
 
-        # Close this tab
         try:
             driver.close()
         except Exception:
@@ -739,7 +910,7 @@ def _work_through_tabs(driver, tab_handles: list, visit_types: list,
 
         bot.ln_sleep(random.uniform(0.5, 1.2), 0.22)
 
-    # Return to original tab (Amazon search results)
+    # Return to search results tab
     try:
         if original_handle in driver.window_handles:
             driver.switch_to.window(original_handle)
@@ -752,100 +923,147 @@ def _work_through_tabs(driver, tab_handles: list, visit_types: list,
     bot._reset_mouse(driver)
 
 # ==============================================================================
-# AMAZON SEARCH BAR
+# AMAZON ON-PAGE SEARCH  (FIX: uses page input, NEVER the address bar)
 # ==============================================================================
 
 def _search_amazon_directly(driver, query: str) -> bool:
     """
-    Type a new query in the Amazon search bar and submit.
-    Used to stay on Amazon between product rounds without going back to Google.
+    Type a new search query into Amazon's ON-PAGE search box and submit.
+    Uses JS focus + Selenium send_keys so the OS cursor never touches
+    the browser address bar.
+
+    Strategy:
+      1. Find #twotabsearchtextbox (or fallback input[name='field-keywords'])
+      2. Scroll it into view
+      3. JS .focus() to activate it without mouse
+      4. Clear via JS .value = ''
+      5. send_keys() character-by-character with human timing
+      6. Press ENTER via send_keys (not pyautogui)
     """
+    search_selectors = [
+        "#twotabsearchtextbox",
+        "input[name='field-keywords']",
+        "input#nav-bb-search",
+        "#nav-search-bar-form input[type='text']",
+    ]
+
+    search_box = None
+    for sel in search_selectors:
+        try:
+            el = WebDriverWait(driver, 6).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            if el.is_displayed() and el.is_enabled():
+                search_box = el
+                break
+        except Exception:
+            continue
+
+    if search_box is None:
+        return False
+
     try:
-        search_box = WebDriverWait(driver, 6).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR,
-                 "#twotabsearchtextbox, input[name='field-keywords']")))
-        bot.mouse_move_to_element(driver, search_box)
-        bot.ln_sleep(random.uniform(0.3, 0.8), 0.20)
-        bot.human_click(driver, search_box)
-        bot.ln_sleep(random.uniform(0.2, 0.5), 0.18)
-        search_box.clear()
-        bot.ln_sleep(random.uniform(0.1, 0.3), 0.15)
+        # Scroll the search box into view
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", search_box)
+        bot.ln_sleep(random.uniform(0.3, 0.7), 0.18)
+
+        # JS focus — activates the input WITHOUT moving the OS mouse/cursor
+        driver.execute_script("arguments[0].focus();", search_box)
+        bot.ln_sleep(random.uniform(0.2, 0.4), 0.15)
+
+        # Clear existing text via JS (avoids triple-click which can miss)
+        driver.execute_script("arguments[0].value = '';", search_box)
+        bot.ln_sleep(random.uniform(0.1, 0.25), 0.12)
+
+        # Type the query with humanised key delay
         bot.human_type(search_box, query)
         bot.ln_sleep(random.uniform(0.3, 0.7), 0.18)
-        pyautogui.press('enter')
-        bot.ln_sleep(random.uniform(2.0, 3.5), 0.22)
+
+        # Submit with ENTER via Selenium (never pyautogui.press)
+        search_box.send_keys(Keys.RETURN)
+        bot.ln_sleep(random.uniform(2.2, 3.8), 0.22)
+
         bot.inject_stealth(driver)
         bot._reset_mouse(driver)
         return True
+
     except Exception:
         return False
 
 # ==============================================================================
-# NAVIGATE TO A PRODUCT PAGE THEN OPEN CAROUSEL TABS
+# BROWSE SEARCH RESULTS AND OPEN TABS
 # ==============================================================================
 
 def _pick_product_and_open_tabs(driver, cfg: AmazonSessionConfig) -> list:
     """
     From an Amazon search results page:
-      1. Click one product to land on its product page
-      2. Open 4-7 tabs from carousels on that product page
-    Returns list of new tab handles.
+      - Scroll naturally through page 1 like a human
+      - Ctrl+Click 3-5 products from page 1 into new tabs
+      - Navigate to page 2 via on-page Next link
+      - Ctrl+Click 1-3 more products from page 2
+    Returns list of all new tab handles.
     """
     if not _is_amazon_search_page(driver):
         return []
 
-    try:
-        WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR,
-                 "[data-component-type='s-search-result']")))
-    except TimeoutException:
-        return []
-
-    bot.ln_sleep(random.uniform(1.0, 2.5), 0.22)
-
-    products = driver.find_elements(
-        By.CSS_SELECTOR,
-        "[data-component-type='s-search-result'] h2 a.a-link-normal"
-    )
-    visible = [p for p in products[:12] if p.is_displayed()]
-    if not visible:
-        return []
-
-    # Pick one product — bias toward top results
-    weights = [1.0 / (i + 1) for i in range(len(visible))]
-    total_w = sum(weights)
-    r = random.random() * total_w
-    chosen = visible[0]
-    cumulative = 0
-    for el, w in zip(visible, weights):
-        cumulative += w
-        if r <= cumulative:
-            chosen = el
-            break
-
-    bot.mouse_move_to_element(driver, chosen)
-    bot.ln_sleep(random.uniform(0.4, 0.9), 0.20)
-    bot.human_click(driver, chosen)
-    bot.ln_sleep(random.uniform(2.5, 4.0), 0.22)
-    bot.inject_stealth(driver)
-    bot._reset_mouse(driver)
-
-    if not _is_amazon_product_page(driver):
-        return []
-
-    # Open tabs from carousels on this product page
-    return _open_tabs_from_product_page(driver, cfg.stop_event)
+    return _human_browse_search_results(driver, cfg.stop_event)
 
 # ==============================================================================
 # GOOGLE -> AMAZON
 # ==============================================================================
 
+def _find_amazon_links_on_google(driver) -> list:
+    """
+    Scrape all Amazon.com result links from the current Google SERP.
+    Returns list of (element, href) tuples, ordered top-to-bottom.
+    Never touches the address bar.
+    """
+    amazon_links = []
+    seen_hrefs   = set()
+
+    # Primary: organic result anchors that point to amazon.com
+    selectors = [
+        "div#search a[href*='amazon.com']",
+        "div#rso   a[href*='amazon.com']",
+        "div.g     a[href*='amazon.com']",
+        "a[href*='amazon.com/s']",
+        "a[href*='amazon.com/dp']",
+        "a[href*='amazon.com/gp']",
+    ]
+    for sel in selectors:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                if not el.is_displayed():
+                    continue
+                href = el.get_attribute("href") or ""
+                if "amazon.com" not in href:
+                    continue
+                # Skip image / thumbnail / ad variants
+                if any(skip in href for skip in [
+                    "/imgres", "google.com", "webcache", "translate"
+                ]):
+                    continue
+                if href in seen_hrefs:
+                    continue
+                seen_hrefs.add(href)
+                amazon_links.append((el, href))
+            except Exception:
+                pass
+
+    return amazon_links
+
+
 def _google_to_amazon(driver, query, cfg: AmazonSessionConfig) -> bool:
     """
-    Search Google for the query, find an Amazon result, click it.
-    Returns True if we landed on an Amazon page.
+    Search Google for the query, find Amazon results, click one.
+    Returns True if we successfully landed on an Amazon page.
+
+    Fixes vs original:
+    - Uses _find_amazon_links_on_google() which directly queries the DOM
+      instead of relying on bot.get_organic_results / bot.click_result
+    - Falls back to scrolling down if no Amazon link found on first look
+    - Falls back to JS navigation if click doesn't load Amazon in time
+    - Never touches the address bar
     """
     roll = random.random()
     if roll < 0.60:
@@ -863,48 +1081,96 @@ def _google_to_amazon(driver, query, cfg: AmazonSessionConfig) -> bool:
     if cfg.stop_event.is_set():
         return False
 
-    bot.ln_sleep(random.uniform(1.2, 3.0), 0.22)
-    bot.scroll_page(driver, random.randint(100, 300))
-    bot.ln_sleep(random.uniform(0.5, 1.5), 0.20)
+    # Wait for organic results to appear
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div#search, div#rso")))
+    except TimeoutException:
+        pass
 
-    results = bot.get_organic_results(driver, max_results=10)
-    amazon_results = [(t, u) for t, u in results if "amazon.com" in u]
+    bot.ln_sleep(random.uniform(1.0, 2.5), 0.22)
 
-    if not amazon_results:
+    # Scroll a bit to simulate reading the SERP
+    bot.scroll_page(driver, random.randint(150, 400))
+    bot.ln_sleep(random.uniform(0.6, 1.5), 0.20)
+
+    # Try to find Amazon links; scroll down more if none visible yet
+    amazon_links = _find_amazon_links_on_google(driver)
+    if not amazon_links:
+        bot.scroll_page(driver, random.randint(300, 600))
+        bot.ln_sleep(random.uniform(0.8, 1.5), 0.20)
+        amazon_links = _find_amazon_links_on_google(driver)
+
+    if not amazon_links:
         return False
 
-    # Bias toward first result
-    weights = [1.0 / (i + 1) for i in range(len(amazon_results))]
-    total_w = sum(weights)
-    r = random.random() * total_w
-    chosen_title, chosen_url = amazon_results[0]
+    # Pick one — bias toward top results
+    weights   = [1.0 / (i + 1) for i in range(len(amazon_links))]
+    total_w   = sum(weights)
+    r         = random.random() * total_w
+    chosen_el, chosen_url = amazon_links[0]
     cumulative = 0
-    for (title, url), w in zip(amazon_results, weights):
+    for (el, url), w in zip(amazon_links, weights):
         cumulative += w
         if r <= cumulative:
-            chosen_title, chosen_url = title, url
+            chosen_el, chosen_url = el, url
             break
 
-    # Hover a couple results before clicking
-    for title, url in amazon_results[:3]:
-        if url == chosen_url:
-            break
+    # Hover 1-2 other results first (realistic browsing)
+    others = [(el, url) for el, url in amazon_links[:4] if url != chosen_url]
+    for el, url in others[:random.randint(0, 2)]:
+        if cfg.stop_event.is_set():
+            return False
         try:
-            els = driver.find_elements(
-                By.CSS_SELECTOR, f"div#search a[href='{url}']")
-            if els and els[0].is_displayed():
-                bot.mouse_move_to_element(driver, els[0])
-                bot.ln_sleep(random.uniform(0.3, 0.9), 0.20)
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el)
+            bot.mouse_move_to_element(driver, el)
+            bot.ln_sleep(random.uniform(0.3, 0.9), 0.20)
         except Exception:
             pass
 
-    bot.click_result(driver, chosen_url)
     if cfg.stop_event.is_set():
         return False
 
+    # Scroll chosen link into view and click it
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", chosen_el)
+        bot.ln_sleep(random.uniform(0.4, 0.9), 0.20)
+        bot.mouse_move_to_element(driver, chosen_el)
+        bot.ln_sleep(random.uniform(0.3, 0.8), 0.20)
+        bot.human_click(driver, chosen_el)
+    except Exception:
+        # Fallback: JS navigation (avoids address bar)
+        try:
+            driver.execute_script(f"window.location.href = arguments[0];",
+                                  chosen_url)
+        except Exception:
+            return False
+
+    if cfg.stop_event.is_set():
+        return False
+
+    # Wait for Amazon to load
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: "amazon.com" in d.current_url)
+    except TimeoutException:
+        # If click didn't navigate, try JS
+        if "amazon.com" not in driver.current_url:
+            try:
+                driver.execute_script(
+                    "window.location.href = arguments[0];", chosen_url)
+                WebDriverWait(driver, 12).until(
+                    lambda d: "amazon.com" in d.current_url)
+            except Exception:
+                return False
+
+    bot.ln_sleep(random.uniform(1.2, 2.5), 0.22)
     bot.inject_stealth(driver)
     bot._reset_mouse(driver)
-    return True
+    return "amazon.com" in driver.current_url
 
 # ==============================================================================
 # ONE AMAZON STINT
@@ -914,8 +1180,8 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
                       stint_type: str, query_pool: list,
                       query_idx: int, progress_fn) -> int:
     """
-    Run one continuous Amazon stint (SHORT: 15-18min or LONG: 20-30min).
-    Loops: search Amazon -> open tabs -> work tabs -> repeat.
+    Run one continuous Amazon stint (SHORT: 15-18 min or LONG: 20-30 min).
+    Loops: search Amazon (on-page) -> open tabs -> work tabs -> repeat.
     Returns updated query_idx.
     """
     if stint_type == STINT_SHORT:
@@ -923,7 +1189,7 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
     else:
         stint_s = random.uniform(20 * 60, 30 * 60)
 
-    stint_end    = time.time() + stint_s
+    stint_end     = time.time() + stint_s
     products_done = 0
 
     progress_fn(
@@ -939,7 +1205,7 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
         cat, query = query_pool[query_idx]
         query_idx += 1
 
-        # Search Amazon directly (we're already on Amazon)
+        # Search via on-page Amazon search box (never address bar)
         progress_fn(f"Searching Amazon: {query[:50]}")
         searched = _search_amazon_directly(driver, query)
 
@@ -950,11 +1216,20 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
             bot.ln_sleep(random.uniform(3.0, 6.0), 0.25)
             continue
 
+        # Wait for search results
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR,
+                     "[data-component-type='s-search-result']")))
+        except TimeoutException:
+            bot.ln_sleep(random.uniform(2.0, 4.0), 0.22)
+
         bot.check_and_wait_captcha(driver)
         if cfg.stop_event.is_set():
             break
 
-        # Navigate to a product page then open carousel tabs
+        # Browse results and open product tabs
         progress_fn(f"Opening product tabs for: {query[:45]}")
         new_tabs = _pick_product_and_open_tabs(driver, cfg)
 
@@ -965,7 +1240,7 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
             bot.ln_sleep(random.uniform(3.0, 6.0), 0.25)
             continue
 
-        # Assign all visit types upfront
+        # Assign visit types upfront
         visit_types  = _assign_visit_types(len(new_tabs))
         deep_count   = visit_types.count(VISIT_DEEP)
         medium_count = visit_types.count(VISIT_MEDIUM)
@@ -975,14 +1250,13 @@ def _run_amazon_stint(driver, cfg: AmazonSessionConfig,
             f"{deep_count} deep / {medium_count} medium / {quick_count} quick"
         )
 
-        # Work through each tab
         _work_through_tabs(driver, new_tabs, visit_types, cfg, progress_fn)
         products_done += len(new_tabs)
 
         if cfg.stop_event.is_set():
             break
 
-        # Inter-query pause before next round
+        # Inter-query pause
         if time.time() < stint_end:
             pause = math.exp(random.gauss(math.log(6.0), 0.40))
             pause = max(2.5, min(15.0, pause))
@@ -1000,11 +1274,12 @@ def run_amazon_session(driver, cfg: AmazonSessionConfig):
     Main entry point called from tab_amazon._worker.
 
     Loop:
-      1. Google -> search -> land on Amazon
-      2. Run a SHORT Amazon stint (15-18 min) -- searching in Amazon search bar
-      3. Go back to Google -> new query -> land on Amazon
-      4. Run a LONG Amazon stint (20-30 min)
-      5. Repeat (alternating SHORT/LONG) until session_minutes expires
+      1. Google -> search -> land on Amazon search results
+      2. Browse page 1 + page 2 -> open tabs -> work through tabs
+      3. Run a SHORT Amazon stint (15-18 min) -- all searches via on-page search bar
+      4. Back to Google -> new query -> land on Amazon
+      5. Run a LONG Amazon stint (20-30 min)
+      6. Repeat (alternating SHORT/LONG) until session_minutes expires
     """
     session_end  = time.time() + cfg.session_minutes * 60
     total_time   = cfg.session_minutes * 60
@@ -1016,7 +1291,7 @@ def run_amazon_session(driver, cfg: AmazonSessionConfig):
         return
 
     query_idx    = 0
-    stint_toggle = STINT_SHORT   # first stint is always SHORT
+    stint_toggle = STINT_SHORT
     google_tab   = driver.current_window_handle
 
     def _progress(text):
@@ -1060,13 +1335,11 @@ def run_amazon_session(driver, cfg: AmazonSessionConfig):
         if cfg.stop_event.is_set():
             break
 
-        # Remember the current tab as google_tab for this cycle
+        # Remember this tab as our "base" Amazon tab for this cycle
         google_tab = driver.current_window_handle
 
-        # ── First round: open tabs directly from the Amazon search page ──
-        # (this is the landing from Google -- we're on Amazon search results)
-        progress_fn = _progress
-        progress_fn(f"Opening product tabs (first round after Google)")
+        # ── First round: browse Amazon search results from Google landing ──
+        _progress("Browsing Amazon search results (first round from Google)")
         first_tabs = _pick_product_and_open_tabs(driver, cfg)
 
         if cfg.stop_event.is_set():
@@ -1083,7 +1356,7 @@ def run_amazon_session(driver, cfg: AmazonSessionConfig):
         if cfg.stop_event.is_set():
             break
 
-        # ── Run the Amazon stint (stays on Amazon, uses Amazon search bar) ──
+        # ── Run the Amazon stint (on-page search, stays on Amazon) ──────
         query_idx = _run_amazon_stint(
             driver=driver,
             cfg=cfg,
@@ -1096,7 +1369,7 @@ def run_amazon_session(driver, cfg: AmazonSessionConfig):
         if cfg.stop_event.is_set():
             break
 
-        # Alternate SHORT <-> LONG for next cycle
+        # Alternate SHORT <-> LONG
         stint_toggle = STINT_LONG if stint_toggle == STINT_SHORT else STINT_SHORT
 
         # Brief pause before returning to Google
