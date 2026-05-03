@@ -478,9 +478,11 @@ def _search_on_amazon_directly(driver, query, cfg: AmazonSessionConfig) -> bool:
     This is how ~40% of real shoppers behave — they bookmark Amazon
     and search directly, not via Google.
     """
-    # Navigate to Amazon homepage
-    bot.navigate_addressbar(driver, "amazon.com")
+    # Navigate to Amazon homepage via driver.get —
+    # address bar is reserved for Google searches only
+    driver.get("https://www.amazon.com")
     bot.inject_stealth(driver)
+    bot.ln_sleep(random.uniform(2.0, 3.5), 0.22)
     bot._reset_mouse(driver)
 
     if cfg.stop_event.is_set():
