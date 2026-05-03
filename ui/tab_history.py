@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QMessageBox
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
 
 from ui.styles import (
     page_title, card, section_title,
@@ -16,6 +16,10 @@ from ui.styles import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH  = BASE_DIR / "data" / "history.db"
+
+# Colour for Amazon sessions in the list
+AMAZON_COLOR = "#e65c00"
+BROWSE_COLOR = "#1a73e8"
 
 
 class HistoryTab(QWidget):
@@ -65,14 +69,19 @@ class HistoryTab(QWidget):
         title_row.addWidget(btn_refresh)
         outer.addLayout(title_row)
 
-        # Stats bar
+        # ── Stats bar (now with Amazon-specific counter) ──────────────────
         stats_card = card()
         stats_lay  = QHBoxLayout(stats_card)
         stats_lay.setContentsMargins(24, 16, 24, 16)
         stats_lay.setSpacing(0)
         self._stat_widgets = {}
-        for key, label in [("total","Total"), ("completed","Completed"),
-                            ("stopped","Stopped"), ("minutes","Total Minutes")]:
+        for key, label in [
+            ("total",     "Total"),
+            ("completed", "Completed"),
+            ("stopped",   "Stopped"),
+            ("amazon",    "Amazon"),
+            ("minutes",   "Total Minutes"),
+        ]:
             frame = QFrame()
             frame.setStyleSheet("border: none; background: none;")
             flay  = QVBoxLayout(frame)
@@ -80,7 +89,9 @@ class HistoryTab(QWidget):
             flay.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val = QLabel("0")
             val.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
-            val.setStyleSheet(f"color: {ACCENT};")
+            # Amazon count uses the orange accent
+            color = AMAZON_COLOR if key == "amazon" else ACCENT
+            val.setStyleSheet(f"color: {color};")
             val.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl = QLabel(label)
             lbl.setFont(QFont("Segoe UI", 9))
@@ -96,7 +107,7 @@ class HistoryTab(QWidget):
         content_row = QHBoxLayout()
         content_row.setSpacing(16)
 
-        # Sessions list
+        # ── Sessions list ─────────────────────────────────────────────────
         list_card = card()
         list_lay  = QVBoxLayout(list_card)
         list_lay.setContentsMargins(0, 0, 0, 0)
@@ -114,7 +125,6 @@ class HistoryTab(QWidget):
             }}
             QListWidget::item {{
                 padding: 10px 16px; border-bottom: 1px solid #f4f6fa;
-                color: {TEXT_MAIN};
             }}
             QListWidget::item:selected {{ background: #e8f0fe; color: {TEXT_MAIN}; }}
             QListWidget::item:hover:!selected {{ background: #f8f9fc; }}
@@ -123,7 +133,7 @@ class HistoryTab(QWidget):
         list_lay.addWidget(self.session_list)
         content_row.addWidget(list_card, 1)
 
-        # Detail panel
+        # ── Detail panel ──────────────────────────────────────────────────
         detail_card = card()
         detail_lay  = QVBoxLayout(detail_card)
         detail_lay.setContentsMargins(0, 0, 0, 0)
@@ -160,30 +170,67 @@ class HistoryTab(QWidget):
         total     = len(rows)
         completed = sum(1 for r in rows if r[4] == "completed")
         stopped   = sum(1 for r in rows if r[4] == "stopped")
+        amazon    = sum(1 for r in rows if (r[2] or "").lower() == "amazon")
         minutes   = sum(r[3] or 0 for r in rows)
 
         self._stat_widgets["total"].setText(str(total))
         self._stat_widgets["completed"].setText(str(completed))
         self._stat_widgets["stopped"].setText(str(stopped))
+        self._stat_widgets["amazon"].setText(str(amazon))
         self._stat_widgets["minutes"].setText(str(minutes))
 
         for row in rows:
             self._sessions_data.append(row)
             sid, date, stype, duration, status, _ = row
-            icon = "✅" if status == "completed" else "⏹"
-            self.session_list.addItem(
-                f"{icon}  {date or '—'}  |  {stype or '—'}  |  {duration or 0} min")
+            stype = stype or "Browse"
+
+            # Icon by status
+            if status == "completed":
+                icon = "✅"
+            elif status == "stopped":
+                icon = "⏹"
+            else:
+                icon = "⚠️"
+
+            # Type badge
+            type_badge = f"[{stype}]"
+
+            item = QListWidgetItem(
+                f"{icon}  {date or '—'}  {type_badge}  •  {duration or 0} min"
+            )
+
+            # Colour Amazon rows differently
+            if stype.lower() == "amazon":
+                item.setForeground(QColor(AMAZON_COLOR))
+            else:
+                item.setForeground(QColor(TEXT_MAIN))
+
+            self.session_list.addItem(item)
 
     def _on_session_selected(self, row):
         if row < 0 or row >= len(self._sessions_data):
             return
         sid, date, stype, duration, status, details = self._sessions_data[row]
-        self._detail_hdr.setText(f"Session #{sid}")
+        stype = stype or "Browse"
+
+        # Header colour
+        color = AMAZON_COLOR if stype.lower() == "amazon" else BROWSE_COLOR
+        self._detail_hdr.setText(f"Session #{sid}  [{stype}]")
+        self._detail_hdr.setStyleSheet(
+            f"color: {color}; font-weight: bold; font-size: 10pt;"
+            f" padding: 14px 16px 8px 16px; border-bottom: 1px solid {BORDER};"
+        )
+
+        # Status emoji
+        status_icon = {"completed": "✅ Completed",
+                       "stopped":   "⏹ Stopped",
+                       "partial":   "⚠️ Partial"}.get(status, status or "—")
+
         self.detail_area.setText(
             f"Date:      {date or '—'}\n"
-            f"Type:      {stype or '—'}\n"
+            f"Type:      {stype}\n"
             f"Duration:  {duration or 0} minutes\n"
-            f"Status:    {status or '—'}\n\n"
+            f"Status:    {status_icon}\n\n"
             f"Details:\n{details or '—'}"
         )
 
