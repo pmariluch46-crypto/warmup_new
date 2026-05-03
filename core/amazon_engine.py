@@ -408,6 +408,122 @@ def _read_reviews(driver, stop_event):
         pass
 
 # ==============================================================================
+# POST-CART BEHAVIOR: browse similar products on the same page
+# ==============================================================================
+
+def _browse_similar_after_cart(driver, stop_event, end_t):
+    """
+    After adding to cart, behave like a real shopper:
+    scroll down to see 'Customers also bought' / 'Similar items' carousels,
+    hover over a few products, occasionally click one to look at it briefly,
+    then navigate back.  Never touches the address bar.
+    """
+    try:
+        # Scroll down to find recommendation carousels
+        carousel_scroll_targets = [
+            "#similarities_feature_div",
+            "#purchase-sims-feature",
+            "#sp_detail",
+            "#anonCarousel1",
+            "[data-feature-name='purchase-sims-feature']",
+            ".p13n-desktop-sims",
+        ]
+        carousel_el = None
+        for sel in carousel_scroll_targets:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", el)
+                    bot.ln_sleep(random.uniform(0.8, 1.8), 0.22)
+                    carousel_el = el
+                    break
+            except Exception:
+                continue
+
+        if stop_event.is_set():
+            return
+
+        # Collect similar product links from carousels
+        similar_selectors = [
+            "#similarities_feature_div a.a-link-normal[href*='/dp/']",
+            "#purchase-sims-feature a[href*='/dp/']",
+            "#sp_detail a.a-link-normal[href*='/dp/']",
+            "#anonCarousel1 a[href*='/dp/']",
+            "#anonCarousel2 a[href*='/dp/']",
+            "[data-feature-name='purchase-sims-feature'] a[href*='/dp/']",
+            ".p13n-sc-uncoverable-faceout a[href*='/dp/']",
+        ]
+        similar_links = []
+        seen = set()
+        for sel in similar_selectors:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    href = el.get_attribute("href") or ""
+                    if "/dp/" in href and href not in seen:
+                        seen.add(href)
+                        similar_links.append((el, href))
+                except Exception:
+                    pass
+            if similar_links:
+                break
+
+        if not similar_links or stop_event.is_set():
+            # No carousel found — just scroll around the page naturally
+            for _ in range(random.randint(2, 4)):
+                if stop_event.is_set() or time.time() >= end_t:
+                    return
+                bot.scroll_page(driver, random.choice([1, -1]) * random.randint(150, 400))
+                bot.ln_sleep(random.uniform(0.8, 2.0), 0.25)
+            return
+
+        # Hover over 2-4 similar products
+        hover_count = random.randint(2, min(4, len(similar_links)))
+        for el, href in random.sample(similar_links[:10], hover_count):
+            if stop_event.is_set() or time.time() >= end_t:
+                return
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", el)
+                bot.ln_sleep(random.uniform(0.3, 0.8), 0.20)
+                bot.mouse_move_to_element(driver, el)
+                bot.ln_sleep(random.uniform(0.6, 1.8), 0.22)
+            except Exception:
+                pass
+
+        # 40% chance: click one similar product, glance at it, go back
+        if random.random() < 0.40 and similar_links and time.time() < end_t:
+            click_el, click_href = random.choice(similar_links[:6])
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", click_el)
+                bot.ln_sleep(random.uniform(0.4, 0.9), 0.20)
+                bot.mouse_move_to_element(driver, click_el)
+                bot.ln_sleep(random.uniform(0.3, 0.7), 0.18)
+                bot.human_click(driver, click_el)
+                bot.ln_sleep(random.uniform(2.5, 5.0), 0.25)
+
+                if not stop_event.is_set() and time.time() < end_t:
+                    # Brief glance: scroll a bit, look at images
+                    bot.scroll_page(driver, random.randint(150, 400))
+                    bot.ln_sleep(random.uniform(1.0, 2.5), 0.22)
+                    _scroll_images(driver, stop_event)
+
+                # Navigate back to the original product page
+                if not stop_event.is_set():
+                    driver.execute_script("window.history.back();")
+                    bot.ln_sleep(random.uniform(1.5, 2.8), 0.22)
+                    bot.inject_stealth(driver)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+
+# ==============================================================================
 # TAB VISIT HANDLERS
 # ==============================================================================
 
@@ -447,21 +563,21 @@ def _visit_deep(driver, cfg: AmazonSessionConfig):
     if cfg.stop_event.is_set():
         return
 
+    # After add-to-cart: browse similar/recommended products on the same page
+    if not cfg.stop_event.is_set() and time.time() < end_t:
+        _browse_similar_after_cart(driver, cfg.stop_event, end_t)
+
+    # Fill any remaining time with natural scrolling / mouse drift
     while time.time() < end_t and not cfg.stop_event.is_set():
         remaining = end_t - time.time()
         if remaining < 0.5:
             break
-        roll = random.random()
-        if roll < 0.35:
+        if random.random() < 0.6:
             bot.scroll_page(driver,
                 random.choice([1, -1]) * random.randint(100, 350))
             bot.ln_sleep(random.uniform(0.5, 1.5), 0.20)
-        elif roll < 0.55:
-            bot.idle_mouse_drift(driver, min(remaining * 0.3, 3.0))
-        elif roll < 0.68:
-            bot.occasional_ctrl_f(driver, chance=1.0, context='amazon')
         else:
-            time.sleep(min(remaining, random.uniform(1.0, 4.0)))
+            bot.idle_mouse_drift(driver, min(remaining * 0.3, 3.0))
 
 
 def _visit_medium(driver, cfg: AmazonSessionConfig):
