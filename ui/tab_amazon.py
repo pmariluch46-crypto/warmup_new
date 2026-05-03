@@ -1,5 +1,8 @@
 import threading
+import time
 import json
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -18,6 +21,7 @@ from ui.styles import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
+DB_PATH  = DATA_DIR / "history.db"
 
 
 AMAZON_CATEGORIES = [
@@ -30,10 +34,61 @@ AMAZON_CATEGORIES = [
     "Movies & TV Shows", "Musical Instruments",
 ]
 
+# ==============================================================================
+# HISTORY HELPERS  (write directly to the same DB that HistoryTab reads)
+# ==============================================================================
+
+def _ensure_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                date     TEXT,
+                type     TEXT,
+                duration INTEGER,
+                status   TEXT,
+                details  TEXT
+            )
+        """)
+
+
+def _save_amazon_session(start_time: float, end_time: float,
+                          categories: list, status: str,
+                          tabs_visited: int, queries_done: int):
+    """
+    Insert one row into the sessions table for a completed Amazon session.
+    """
+    try:
+        _ensure_db()
+        duration_m = max(1, round((end_time - start_time) / 60))
+        date_str   = datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M")
+        cats_str   = ", ".join(categories) if categories else "—"
+        details    = (
+            f"Categories: {cats_str}\n"
+            f"Tabs visited: {tabs_visited}\n"
+            f"Queries run: {queries_done}\n"
+            f"Started:  {datetime.fromtimestamp(start_time).strftime('%H:%M:%S')}\n"
+            f"Finished: {datetime.fromtimestamp(end_time).strftime('%H:%M:%S')}"
+        )
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO sessions (date, type, duration, status, details) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (date_str, "Amazon", duration_m, status, details)
+            )
+    except Exception:
+        pass  # never crash the UI over a history write
+
+
+# ==============================================================================
+# AMAZON TAB
+# ==============================================================================
 
 class AmazonTab(QWidget):
-    _sig_progress = pyqtSignal(str, int)
-    _sig_status   = pyqtSignal(str, str)
+    _sig_progress        = pyqtSignal(str, int)
+    _sig_status          = pyqtSignal(str, str)
+    _sig_refresh_history = pyqtSignal()
 
     def __init__(self, settings, main_window):
         super().__init__()
@@ -43,8 +98,13 @@ class AmazonTab(QWidget):
         self._queries    = {}
         self._current_cat = None
 
+        # Session tracking counters (updated from worker thread)
+        self._session_tabs_visited  = 0
+        self._session_queries_done  = 0
+
         self._sig_progress.connect(self._on_progress)
         self._sig_status.connect(self._on_status)
+        self._sig_refresh_history.connect(self._on_refresh_history)
 
         self.setStyleSheet(f"background: {BG_PAGE};")
         self._load_queries()
@@ -140,7 +200,6 @@ class AmazonTab(QWidget):
         lay.setSpacing(10)
         lay.addWidget(section_title("Active Categories"))
 
-        # All / None buttons
         btn_row = QHBoxLayout()
         btn_all = secondary_btn("All")
         btn_all.setFixedWidth(60)
@@ -153,7 +212,6 @@ class AmazonTab(QWidget):
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
-        # Grid of checkboxes — 2 columns
         grid = QGridLayout()
         grid.setSpacing(6)
         self._cat_checks = {}
@@ -162,7 +220,6 @@ class AmazonTab(QWidget):
             self._cat_checks[cat] = cb
             grid.addWidget(cb, i // 2, i % 2)
 
-        # Own Requests special checkbox
         self._own_requests_cb = styled_checkbox("⭐ Own Requests", ACCENT2)
         self._own_requests_cb.setStyleSheet(
             self._own_requests_cb.styleSheet() +
@@ -181,7 +238,6 @@ class AmazonTab(QWidget):
         lay.setSpacing(10)
         lay.addWidget(section_title("Session Settings"))
 
-        # Duration slider
         row = QHBoxLayout()
         lbl = QLabel("Session duration (minutes)")
         lbl.setFont(QFont("Segoe UI", 9))
@@ -237,7 +293,6 @@ class AmazonTab(QWidget):
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(10)
 
-        # Header
         hdr = QHBoxLayout()
         hdr.addWidget(section_title("Query Editor"))
         hint = QLabel("Click a category to view/edit its queries")
@@ -246,7 +301,6 @@ class AmazonTab(QWidget):
         hdr.addWidget(hint)
         hdr.addStretch()
 
-        # Action buttons
         self.btn_save_q = secondary_btn("Save")
         self.btn_save_q.setFixedWidth(70)
         self.btn_save_q.clicked.connect(self._save_current_queries)
@@ -264,11 +318,9 @@ class AmazonTab(QWidget):
         hdr.addWidget(self.btn_add_q)
         lay.addLayout(hdr)
 
-        # Main area: categories list | queries list
         split = QHBoxLayout()
         split.setSpacing(12)
 
-        # Categories list
         cat_frame = QFrame()
         cat_frame.setStyleSheet(f"""
             QFrame {{
@@ -314,7 +366,6 @@ class AmazonTab(QWidget):
         cat_vbox.addWidget(self.cat_list)
         split.addWidget(cat_frame, 2)
 
-        # Queries list + edit
         q_frame = QFrame()
         q_frame.setStyleSheet(f"""
             QFrame {{
@@ -375,6 +426,8 @@ class AmazonTab(QWidget):
         lay.addLayout(split, 1)
         return c
 
+    # ── Query editor handlers ──────────────────────────────────────────────
+
     def _on_cat_selected(self, row):
         if row < 0:
             return
@@ -383,7 +436,8 @@ class AmazonTab(QWidget):
             self._current_cat = items[row]
         else:
             return
-        self.query_header.setText(f"{self._current_cat} — {len(self._queries.get(self._current_cat, []))} queries")
+        n = len(self._queries.get(self._current_cat, []))
+        self.query_header.setText(f"{self._current_cat} — {n} queries")
         self.query_list.clear()
         for q in self._queries.get(self._current_cat, []):
             self.query_list.addItem(q)
@@ -421,7 +475,6 @@ class AmazonTab(QWidget):
         self._update_cat_header()
 
     def _save_current_queries(self):
-        # Sync from list widget
         if self._current_cat:
             qs = [self.query_list.item(i).text()
                   for i in range(self.query_list.count())]
@@ -459,6 +512,8 @@ class AmazonTab(QWidget):
         except Exception:
             self.firefox_label.setText("")
 
+    # ── Session start / stop ───────────────────────────────────────────────
+
     def _start(self):
         cats = self._get_selected_categories()
         if not cats:
@@ -468,6 +523,11 @@ class AmazonTab(QWidget):
             return
 
         self._stop_event = threading.Event()
+
+        # Reset per-session counters
+        self._session_tabs_visited = 0
+        self._session_queries_done = 0
+
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -476,16 +536,32 @@ class AmazonTab(QWidget):
         from core.amazon_engine import AmazonSessionConfig, run_amazon_session
         from core import browser_bot as bot
 
+        # Wrap on_progress to count queries
+        def _counting_progress(text, pct):
+            # Heuristic: each "Searching Amazon:" line = one query done
+            if text.startswith("Searching Amazon:"):
+                self._session_queries_done += 1
+            # Each "tabs:" line tells us how many tabs were opened
+            if "tabs:" in text and text[0].isdigit():
+                try:
+                    n = int(text.split(" tabs:")[0].strip())
+                    self._session_tabs_visited += n
+                except Exception:
+                    pass
+            self._emit_progress(text, pct)
+
         cfg = AmazonSessionConfig(
             categories=cats,
             session_minutes=self.sl_duration.value(),
             read_reviews=self.cb_reviews.isChecked(),
             stop_event=self._stop_event,
-            on_progress=self._emit_progress,
+            on_progress=_counting_progress,
         )
 
         def worker():
-            driver = None
+            driver     = None
+            start_time = time.time()
+            status     = "stopped"
             try:
                 driver = bot.create_driver(
                     self.settings.firefox_binary,
@@ -494,18 +570,59 @@ class AmazonTab(QWidget):
                 )
                 bot.set_captcha_handler(None, self._stop_event)
                 run_amazon_session(driver, cfg)
+                status = "stopped" if self._stop_event.is_set() else "completed"
             except Exception as e:
+                status = "partial"
                 self._emit_progress(f"Error: {e}", 0)
             finally:
+                end_time = time.time()
                 if driver:
                     try:
                         driver.quit()
                     except Exception:
                         pass
-                bot.clear_captcha_handler()
+                try:
+                    bot.clear_captcha_handler()
+                except Exception:
+                    pass
+
+                # ── Save to history DB ────────────────────────────────
+                try:
+                    _save_amazon_session(
+                        start_time=start_time,
+                        end_time=end_time,
+                        categories=cats,
+                        status=status,
+                        tabs_visited=self._session_tabs_visited,
+                        queries_done=self._session_queries_done,
+                    )
+                except Exception:
+                    pass
+
+                # ── Tell the History tab to refresh ───────────────────
+                try:
+                    history_tab = self.main_window.get_tab("history")
+                    if history_tab and hasattr(history_tab, "refresh"):
+                        self._sig_refresh_history.emit()
+                except Exception:
+                    pass
+
                 self._emit_status("Idle", "#5a6a8a")
 
         threading.Thread(target=worker, daemon=True).start()
+
+        # Start elapsed-time ticker
+        self._start_time = time.time()
+        self._tick_elapsed()
+
+    def _tick_elapsed(self):
+        """Update the elapsed label every second while running."""
+        if self._stop_event and not self._stop_event.is_set():
+            elapsed = int(time.time() - self._start_time)
+            m, s = divmod(elapsed, 60)
+            self.elapsed_label.setText(f"Elapsed: {m}:{s:02d}")
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1000, self._tick_elapsed)
 
     def _stop(self):
         if self._stop_event:
@@ -513,6 +630,8 @@ class AmazonTab(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.main_window.set_status("Idle", "#5a6a8a")
+
+    # ── Signal emitters (thread-safe) ──────────────────────────────────────
 
     def _emit_progress(self, text, pct):
         self._sig_progress.emit(text, int(pct))
@@ -529,3 +648,11 @@ class AmazonTab(QWidget):
 
     def _on_status(self, text, color):
         self.main_window.set_status(text, color)
+    def _on_refresh_history(self):
+        """Called from worker thread via signal — safely refresh History tab."""
+        try:
+            history_tab = self.main_window.get_tab("history")
+            if history_tab and hasattr(history_tab, "refresh"):
+                history_tab.refresh()
+        except Exception:
+            pass
