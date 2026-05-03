@@ -863,7 +863,7 @@ def navigate_addressbar(driver, url: str):
 
         for ch in display:
             pyautogui.typewrite(ch, interval=0)
-            time.sleep(max(0.03, random.gauss(0.09, 0.03)))
+            time.sleep(max(0.06, random.gauss(0.20, 0.06)))
 
         ln_sleep(0.30, 0.16)
         pyautogui.press('enter')
