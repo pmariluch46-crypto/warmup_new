@@ -1,21 +1,28 @@
 {
-  "firefox_binary": "O:/FirefoxPortable/App/firefox64/firefox.exe",
-  "firefox_profile": "O:/FirefoxPortable/Data/profile",
-  "geckodriver_path": "assets\\geckodriver.exe",
-  "read_speed": 0.7,
-  "min_session_gap_minutes": 1,
-  "auto_close_browser": true,
-  "retry_crashed_phases": true,
-  "max_retries": 1,
-  "theme": "light",
-  "browse1_minutes": 5,
-  "idle_minutes": 1,
-  "browse2_minutes": 6,
-  "min_per_category": 2,
-  "max_per_category": 4,
-  "selected_categories": [
-    "News & Events",
-    "Weather"
-  ],
-  "last_session_end": null
+    "firefox_binary": "O:/FirefoxPortable/App/firefox64/firefox.exe",
+    "firefox_profile": "O:/FirefoxPortable/Data/profile",
+    "geckodriver": "Q:\\warmup_new-main\\warmup_new-main\\drivers\\geckodriver.exe",
+    "close_after_session": true,
+    "retry_crashes": true,
+    "max_retries": 1,
+    "session_gap_min": 1,
+    "read_speed": 0.7,
+    "scheduled_jobs": [],
+    "scheduler_enabled": false,
+    "language": "en",
+    "geckodriver_path": "assets\\geckodriver.exe",
+    "min_session_gap_minutes": 1,
+    "auto_close_browser": true,
+    "retry_crashed_phases": true,
+    "theme": "light",
+    "browse1_minutes": 5,
+    "idle_minutes": 1,
+    "browse2_minutes": 6,
+    "min_per_category": 2,
+    "max_per_category": 4,
+    "selected_categories": [
+        "News & Events",
+        "Weather"
+    ],
+    "last_session_end": null
 }
