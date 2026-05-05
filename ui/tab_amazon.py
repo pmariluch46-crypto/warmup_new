@@ -35,12 +35,18 @@ AMAZON_CATEGORIES = [
 ]
 
 # ==============================================================================
-# HISTORY HELPERS  (write directly to the same DB that HistoryTab reads)
+# HISTORY HELPERS
 # ==============================================================================
 
 def _ensure_db():
+    """
+    Create the sessions table if it doesn't exist.
+    Also migrates older databases that are missing columns — so the app
+    never crashes on schema changes even if the user has an old history.db.
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
+        # Create table with full schema if it doesn't exist at all
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +57,29 @@ def _ensure_db():
                 details  TEXT
             )
         """)
+        conn.commit()
+
+        # ── Migration: add any missing columns to existing tables ──────────
+        # Handles the case where an old DB was created without some columns.
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions);")
+        }
+        required_columns = {
+            "date":     "TEXT",
+            "type":     "TEXT",
+            "duration": "INTEGER",
+            "status":   "TEXT",
+            "details":  "TEXT",
+        }
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_columns:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type};")
+                    conn.commit()
+                    print(f"[history] Migrated DB: added column '{col_name}'")
+                except Exception as e:
+                    print(f"[history] Migration warning for column '{col_name}': {e}")
 
 
 def _save_amazon_session(start_time: float, end_time: float,
@@ -77,8 +106,10 @@ def _save_amazon_session(start_time: float, end_time: float,
                 "VALUES (?, ?, ?, ?, ?)",
                 (date_str, "Amazon", duration_m, status, details)
             )
-    except Exception:
-        pass  # never crash the UI over a history write
+        print(f"[history] Session saved — {duration_m} min, {tabs_visited} tabs, "
+              f"status={status}, db={DB_PATH}")
+    except Exception as e:
+        print(f"[history] ERROR saving session: {e}  (db={DB_PATH})")
 
 
 # ==============================================================================
@@ -98,7 +129,6 @@ class AmazonTab(QWidget):
         self._queries    = {}
         self._current_cat = None
 
-        # Session tracking counters (updated from worker thread)
         self._session_tabs_visited  = 0
         self._session_queries_done  = 0
 
@@ -148,9 +178,10 @@ class AmazonTab(QWidget):
         title_row.addWidget(self.firefox_label)
         outer.addLayout(title_row)
 
-        # ── Main splitter: left config | right query editor ────────────────
+        # ── Main splitter ─────────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background: #e0e5f0; width: 1px; }")
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: #e0e5f0; width: 1px; }")
 
         # Left panel
         left_widget = QWidget()
@@ -164,7 +195,6 @@ class AmazonTab(QWidget):
         left_vbox.addWidget(self._build_progress_card())
         left_vbox.addStretch()
 
-        # Buttons
         btn_row = QHBoxLayout()
         self.btn_start = success_btn("Start Amazon Session")
         self.btn_start.clicked.connect(self._start)
@@ -333,7 +363,8 @@ class AmazonTab(QWidget):
         cat_vbox.setContentsMargins(0, 0, 0, 0)
         cat_hdr = QLabel("Categories")
         cat_hdr.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        cat_hdr.setStyleSheet(f"color: {TEXT_SUB}; padding: 8px 12px 4px 12px;")
+        cat_hdr.setStyleSheet(
+            f"color: {TEXT_SUB}; padding: 8px 12px 4px 12px;")
         cat_vbox.addWidget(cat_hdr)
 
         self.cat_list = QListWidget()
@@ -360,7 +391,8 @@ class AmazonTab(QWidget):
         for cat in AMAZON_CATEGORIES:
             self.cat_list.addItem(cat)
         own = QListWidgetItem("⭐ Own Requests")
-        own.setForeground(__import__('PyQt6.QtGui', fromlist=['QColor']).QColor(ACCENT2))
+        own.setForeground(
+            __import__('PyQt6.QtGui', fromlist=['QColor']).QColor(ACCENT2))
         self.cat_list.addItem(own)
         self.cat_list.currentRowChanged.connect(self._on_cat_selected)
         cat_vbox.addWidget(self.cat_list)
@@ -405,7 +437,8 @@ class AmazonTab(QWidget):
 
         edit_lbl = QLabel("Edit selected query:")
         edit_lbl.setFont(QFont("Segoe UI", 8))
-        edit_lbl.setStyleSheet(f"color: {TEXT_SUB}; padding: 4px 12px 0 12px;")
+        edit_lbl.setStyleSheet(
+            f"color: {TEXT_SUB}; padding: 4px 12px 0 12px;")
         q_vbox.addWidget(edit_lbl)
 
         self.query_edit = QTextEdit()
@@ -505,10 +538,12 @@ class AmazonTab(QWidget):
             s = self.settings
             if os.path.exists(s.firefox_binary) and os.path.exists(s.geckodriver):
                 self.firefox_label.setText("Firefox paths configured correctly.")
-                self.firefox_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+                self.firefox_label.setStyleSheet(
+                    "color: #2e7d32; font-weight: bold;")
             else:
                 self.firefox_label.setText("Firefox paths not configured.")
-                self.firefox_label.setStyleSheet("color: #c62828; font-weight: bold;")
+                self.firefox_label.setStyleSheet(
+                    "color: #c62828; font-weight: bold;")
         except Exception:
             self.firefox_label.setText("")
 
@@ -523,8 +558,6 @@ class AmazonTab(QWidget):
             return
 
         self._stop_event = threading.Event()
-
-        # Reset per-session counters
         self._session_tabs_visited = 0
         self._session_queries_done = 0
 
@@ -536,12 +569,9 @@ class AmazonTab(QWidget):
         from core.amazon_engine import AmazonSessionConfig, run_amazon_session
         from core import browser_bot as bot
 
-        # Wrap on_progress to count queries
         def _counting_progress(text, pct):
-            # Heuristic: each "Searching Amazon:" line = one query done
             if text.startswith("Searching Amazon:"):
                 self._session_queries_done += 1
-            # Each "tabs:" line tells us how many tabs were opened
             if "tabs:" in text and text[0].isdigit():
                 try:
                     n = int(text.split(" tabs:")[0].strip())
@@ -574,6 +604,7 @@ class AmazonTab(QWidget):
             except Exception as e:
                 status = "partial"
                 self._emit_progress(f"Error: {e}", 0)
+                print(f"[worker] Exception: {e}")
             finally:
                 end_time = time.time()
                 if driver:
@@ -586,37 +617,24 @@ class AmazonTab(QWidget):
                 except Exception:
                     pass
 
-                # ── Save to history DB ────────────────────────────────
-                try:
-                    _save_amazon_session(
-                        start_time=start_time,
-                        end_time=end_time,
-                        categories=cats,
-                        status=status,
-                        tabs_visited=self._session_tabs_visited,
-                        queries_done=self._session_queries_done,
-                    )
-                except Exception:
-                    pass
+                _save_amazon_session(
+                    start_time=start_time,
+                    end_time=end_time,
+                    categories=cats,
+                    status=status,
+                    tabs_visited=self._session_tabs_visited,
+                    queries_done=self._session_queries_done,
+                )
 
-                # ── Tell the History tab to refresh ───────────────────
-                try:
-                    history_tab = self.main_window.get_tab("history")
-                    if history_tab and hasattr(history_tab, "refresh"):
-                        self._sig_refresh_history.emit()
-                except Exception:
-                    pass
-
+                self._sig_refresh_history.emit()
                 self._emit_status("Idle", "#5a6a8a")
 
         threading.Thread(target=worker, daemon=True).start()
 
-        # Start elapsed-time ticker
         self._start_time = time.time()
         self._tick_elapsed()
 
     def _tick_elapsed(self):
-        """Update the elapsed label every second while running."""
         if self._stop_event and not self._stop_event.is_set():
             elapsed = int(time.time() - self._start_time)
             m, s = divmod(elapsed, 60)
@@ -648,11 +666,14 @@ class AmazonTab(QWidget):
 
     def _on_status(self, text, color):
         self.main_window.set_status(text, color)
+
     def _on_refresh_history(self):
-        """Called from worker thread via signal — safely refresh History tab."""
         try:
-            history_tab = self.main_window.get_tab("history")
-            if history_tab and hasattr(history_tab, "refresh"):
+            history_tab = self.main_window.tab_history
+            if hasattr(history_tab, "refresh"):
                 history_tab.refresh()
-        except Exception:
-            pass
+                print("[history] History tab refreshed.")
+            else:
+                print("[history] WARNING: tab_history has no refresh() method.")
+        except Exception as e:
+            print(f"[history] ERROR refreshing history tab: {e}")
