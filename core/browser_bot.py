@@ -3,6 +3,15 @@ core/browser_bot.py  --  Human-like Firefox automation engine.
 
 All paths (Firefox binary, profile, geckodriver) are passed in at runtime
 so the app can work with any user-selected Firefox installation.
+
+FIXES vs previous version:
+  - scroll_page() uses WHEEL ONLY — scrollbar_drag_scroll() removed from mix.
+    The scrollbar drag was moving the physical mouse to the right edge of the
+    screen (hitting the VPN button / browser chrome area).
+  - idle_mouse_drift() removed from google_search() — was drifting into corners.
+  - scrollbar_drag_scroll() kept as a standalone function but never called
+    automatically.
+  - _reset_mouse() now places mouse in the safe center of the viewport only.
 """
 
 import time
@@ -89,7 +98,7 @@ def _si_move(x, y):
 
 def _si_click(x, y):
     _si_ldown(x, y)
-    time.sleep(random.uniform(0.04, 0.09))  # variable hold time
+    time.sleep(random.uniform(0.04, 0.09))
     _si_lup(x, y)
 
 
@@ -120,10 +129,9 @@ def reaction_delay():
     ln_sleep(0.22, 0.30)
 
 
-# FIX: Variable reading pace — humans read at different speeds
 def reading_pause(text_length):
     """Pause proportional to text length, with natural variance."""
-    base = text_length / random.uniform(900, 1400)  # chars per second reading speed
+    base = text_length / random.uniform(900, 1400)
     base = max(0.8, min(12.0, base))
     ln_sleep(base, 0.22)
 
@@ -165,7 +173,6 @@ def _element_screen_center(driver, element):
     return info['x'], info['y']
 
 
-# FIX: Click slightly off-center — humans never click perfectly center
 def _element_screen_point(driver, element):
     """Returns a slightly randomised point within the element, not dead center."""
     info = driver.execute_script("""
@@ -176,7 +183,6 @@ def _element_screen_point(driver, element):
             w: r.width, h: r.height
         };
     """, element)
-    # Offset by up to 30% of element dimensions
     ox = random.gauss(0, info['w'] * 0.12)
     oy = random.gauss(0, info['h'] * 0.12)
     return int(info['cx'] + ox), int(info['cy'] + oy)
@@ -250,19 +256,50 @@ def _build_path(start, end, overshoot=False):
     return all_points
 
 
+# Safe viewport bounds — keeps mouse away from browser chrome (top) and
+# scrollbar (right edge). Top 120px = browser toolbar. Right 20px = scrollbar.
+_SAFE_TOP    = 130   # px from top of screen — below browser chrome
+_SAFE_RIGHT  = 20    # px from right edge — avoids scrollbar
+
+
+def _safe_viewport_point(driver):
+    """
+    Return a random (vx, vy) guaranteed to be inside the page content area —
+    never in the browser toolbar, address bar, or scrollbar.
+    """
+    try:
+        vw = driver.execute_script("return window.innerWidth;")
+        vh = driver.execute_script("return window.innerHeight;")
+    except Exception:
+        vw, vh = VIEWPORT_W, VIEWPORT_H
+
+    vx = random.randint(60, max(61, vw - _SAFE_RIGHT - 10))
+    vy = random.randint(80, max(81, vh - 60))
+    return vx, vy
+
+
 def _reset_mouse(driver):
+    """Move mouse to a safe central area of the page content — never chrome."""
     global _mx, _my
-    # FIX: reset to a random position, not always dead center
-    _mx = random.randint(VIEWPORT_W // 3, 2 * VIEWPORT_W // 3)
-    _my = random.randint(VIEWPORT_H // 3, 2 * VIEWPORT_H // 3)
-    sx, sy = _clamp_screen(*_vp_to_screen(driver, _mx, _my))
+    try:
+        vw = driver.execute_script("return window.innerWidth;")
+        vh = driver.execute_script("return window.innerHeight;")
+    except Exception:
+        vw, vh = VIEWPORT_W, VIEWPORT_H
+
+    # Use middle 40% of viewport both axes
+    _mx = random.randint(int(vw * 0.30), int(vw * 0.70))
+    _my = random.randint(int(vh * 0.35), int(vh * 0.65))
+
+    ox, oy = _screen_origin(driver)
+    sx, sy = _clamp_screen(ox + _mx, oy + _my)
     pyautogui.moveTo(sx, sy)
 
 
 def _move_path(driver, path):
     ox, oy = _screen_origin(driver)
     n = len(path)
-    speed_bias = random.gauss(1.0, 0.18)  # FIX: wider variance = more personality
+    speed_bias = random.gauss(1.0, 0.18)
     for i, pt in enumerate(path):
         sx, sy = _clamp_screen(ox + pt[0], oy + pt[1])
         pyautogui.moveTo(sx, sy)
@@ -270,7 +307,7 @@ def _move_path(driver, path):
         speed_factor = 1.0 - 0.55*(1 - abs(2*progress - 1))
         step_t = (0.012 + 0.018*speed_factor) * speed_bias + random.gauss(0, 0.002)
         time.sleep(max(0.007, step_t))
-        if random.random() < 0.014:  # FIX: slightly more frequent micro-pauses
+        if random.random() < 0.014:
             time.sleep(random.uniform(0.05, 0.30))
 
 
@@ -296,19 +333,35 @@ def _is_in_viewport(driver, element) -> bool:
 
 
 def mouse_move_to_element(driver, element):
+    """
+    Move mouse to an element. Always scrolls element into view first so the
+    computed screen coords are inside the visible page — never in chrome/scrollbar.
+    """
     global _mx, _my
-    if not _is_in_viewport(driver, element):
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center',inline:'nearest'});", element)
-        ln_sleep(0.38, 0.25)
-    sx, sy = _element_screen_point(driver, element)  # FIX: use off-center point
+    # Always scroll into view — ensures element is in visible content area
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center',inline:'nearest'});", element)
+    ln_sleep(0.30, 0.22)
+
+    sx, sy = _element_screen_point(driver, element)
     ox, oy = _screen_origin(driver)
     tvx = sx - ox
     tvy = sy - oy
+
+    # Clamp to safe content area — never let mouse drift to scrollbar or chrome
+    try:
+        vw = driver.execute_script("return window.innerWidth;")
+        vh = driver.execute_script("return window.innerHeight;")
+    except Exception:
+        vw, vh = VIEWPORT_W, VIEWPORT_H
+
+    tvx = max(10, min(vw - _SAFE_RIGHT - 5, tvx))
+    tvy = max(10, min(vh - 10, tvy))
+
     path = _build_path((_mx, _my), (tvx, tvy), overshoot=random.random() < 0.05)
     _move_path(driver, path)
-    _mx = max(5, min(VIEWPORT_W-5, tvx))
-    _my = max(5, min(VIEWPORT_H-5, tvy))
+    _mx = tvx
+    _my = tvy
 
 
 def hover_jitter(driver, duration=1.0):
@@ -331,7 +384,7 @@ def hover_jitter(driver, duration=1.0):
 def human_click(driver, element):
     mouse_move_to_element(driver, element)
     hover_jitter(driver, duration=random.uniform(0.06, 0.32))
-    sx, sy = _element_screen_point(driver, element)  # FIX: off-center click
+    sx, sy = _element_screen_point(driver, element)
     sx, sy = _clamp_screen(sx, sy)
     pyautogui.moveTo(sx, sy, duration=random.uniform(0.08, 0.18))
     time.sleep(random.uniform(0.08, 0.14))
@@ -339,7 +392,6 @@ def human_click(driver, element):
     ln_sleep(0.42, 0.28)
 
 
-# FIX: Occasionally double-tap accidentally (rare but human)
 def human_click_maybe_double(driver, element):
     mouse_move_to_element(driver, element)
     hover_jitter(driver, duration=random.uniform(0.06, 0.32))
@@ -347,7 +399,7 @@ def human_click_maybe_double(driver, element):
     sx, sy = _clamp_screen(sx, sy)
     pyautogui.moveTo(sx, sy, duration=random.uniform(0.08, 0.18))
     time.sleep(random.uniform(0.08, 0.14))
-    if random.random() < 0.03:  # 3% accidental double click
+    if random.random() < 0.03:
         _si_dblclick(sx, sy)
     else:
         _si_click(sx, sy)
@@ -355,43 +407,36 @@ def human_click_maybe_double(driver, element):
 
 
 def idle_mouse_drift(driver, duration=2.0):
+    """
+    Gentle mouse drift that stays INSIDE the page content area.
+    Never moves to screen edges, scrollbar, or browser chrome.
+    Only small relative moves — no long jumps to corners.
+    """
+    try:
+        vw = driver.execute_script("return window.innerWidth;")
+        vh = driver.execute_script("return window.innerHeight;")
+    except Exception:
+        vw, vh = VIEWPORT_W, VIEWPORT_H
+
     end_t = time.time() + duration
     while time.time() < end_t:
-        r = random.random()
-        if r < 0.12:
-            edge = random.choice(['bottom', 'left', 'right'])
-            if edge == 'bottom':
-                nx = random.randint(100, _SCREEN_W - 100)
-                ny = random.randint(_SCREEN_H - 80, _SCREEN_H - _MARGIN)
-            elif edge == 'left':
-                nx = random.randint(_MARGIN, 80)
-                ny = random.randint(100, _SCREEN_H - 100)
-            else:
-                nx = random.randint(_SCREEN_W - 80, _SCREEN_W - _MARGIN)
-                ny = random.randint(100, _SCREEN_H - 100)
-            mouse_move(driver, nx, ny)
-            ln_sleep(random.uniform(0.4, 2.2), 0.30)
-            mouse_move(driver, random.randint(300, VIEWPORT_W-300),
-                                random.randint(200, VIEWPORT_H-200))
-        else:
-            dx = random.randint(-70, 70)
-            dy = random.randint(-45, 45)
-            nx = max(10, min(VIEWPORT_W-10, _mx+dx))
-            ny = max(10, min(VIEWPORT_H-10, _my+dy))
-            mouse_move(driver, nx, ny)
-            hover_jitter(driver, duration=random.uniform(0.18, 0.65))
+        # Small relative drift — max 80px in any direction
+        dx = random.randint(-80, 80)
+        dy = random.randint(-60, 60)
+        nx = max(60, min(vw - _SAFE_RIGHT - 10, _mx + dx))
+        ny = max(80, min(vh - 60, _my + dy))
+        mouse_move(driver, nx, ny)
+        hover_jitter(driver, duration=random.uniform(0.18, 0.55))
 
 
 # ==============================================================================
-#  SCROLL
+#  SCROLL  (FIX: wheel only — no scrollbar drag)
 # ==============================================================================
 
 def wheel_scroll_smooth(driver, pixels):
+    """Scroll using the mouse wheel — stays in place, never moves to scrollbar."""
     if pixels == 0:
         return
-
-    ox, oy = _screen_origin(driver)
-    sx, sy = _clamp_screen(ox + _mx, oy + _my)
 
     direction = -1 if pixels > 0 else 1
     total_px  = abs(pixels)
@@ -404,6 +449,9 @@ def wheel_scroll_smooth(driver, pixels):
 
     next_drift_at = random.randint(2, 5)
 
+    ox, oy = _screen_origin(driver)
+    sx, sy = _clamp_screen(ox + _mx, oy + _my)
+
     for i in range(n_ticks):
         _si_wheel(direction)
 
@@ -412,9 +460,10 @@ def wheel_scroll_smooth(driver, pixels):
         tick_delay = base_delay * curve * speed_bias + random.gauss(0, 0.006)
         time.sleep(max(0.025, tick_delay))
 
+        # Tiny cursor micro-drift during scroll — stays near current position
         if i >= next_drift_at and i < n_ticks - 1:
-            dx = random.randint(-8, 8)
-            dy = random.randint(-6, 6)
+            dx = random.randint(-6, 6)
+            dy = random.randint(-5, 5)
             new_sx = max(5, min(pyautogui.size()[0] - 5, sx + dx))
             new_sy = max(5, min(pyautogui.size()[1] - 5, sy + dy))
             pyautogui.moveTo(new_sx, new_sy, duration=random.uniform(0.02, 0.07))
@@ -425,6 +474,11 @@ def wheel_scroll_smooth(driver, pixels):
 
 
 def scrollbar_drag_scroll(driver, pixels):
+    """
+    Scrollbar drag — kept for completeness but NOT called automatically.
+    Only use this if you explicitly want a scrollbar interaction.
+    WARNING: moves mouse to right edge of screen.
+    """
     if pixels == 0:
         return
     try:
@@ -477,7 +531,6 @@ def scrollbar_drag_scroll(driver, pixels):
 
         pyautogui.moveTo(sb_x, cur_center, duration=random.uniform(0.22, 0.58))
         time.sleep(0.18)
-
         _si_ldown(sb_x, cur_center)
         ln_sleep(0.05, 0.04)
 
@@ -499,13 +552,17 @@ def scrollbar_drag_scroll(driver, pixels):
         _si_lup(last_cx, last_cy)
         time.sleep(0.35)
 
+        # After drag: move mouse back to safe page content area
         ox, oy = _screen_origin(driver)
-        away_x = random.randint(150, max(200, inner_h - 150))
-        away_y = random.randint(200, max(250, inner_h - 150))
-        _si_move(ox + away_x, oy + away_y)
+        try:
+            vw = driver.execute_script("return window.innerWidth;")
+            vh = driver.execute_script("return window.innerHeight;")
+        except Exception:
+            vw, vh = VIEWPORT_W, VIEWPORT_H
         global _mx, _my
-        _mx = away_x
-        _my = away_y
+        _mx = random.randint(int(vw * 0.25), int(vw * 0.65))
+        _my = random.randint(int(vh * 0.30), int(vh * 0.65))
+        _si_move(ox + _mx, oy + _my)
 
     except Exception:
         pass
@@ -513,16 +570,13 @@ def scrollbar_drag_scroll(driver, pixels):
 
 def scroll_page(driver, pixels):
     """
-    FIX: Mix scrollbar drag and wheel scroll naturally.
-    Real users use both — mostly wheel, occasionally scrollbar.
+    FIX: Wheel scroll ONLY — never moves mouse to the scrollbar.
+    Real users scroll with the wheel wheel 95%+ of the time.
+    scrollbar_drag_scroll() is available separately but not called here.
     """
-    if random.random() < 0.25:
-        scrollbar_drag_scroll(driver, pixels)
-    else:
-        wheel_scroll_smooth(driver, pixels)
+    wheel_scroll_smooth(driver, pixels)
 
 
-# FIX: Natural multi-step scroll — humans rarely do one big scroll
 def scroll_natural(driver, total_pixels, stop_event=None):
     """
     Scroll total_pixels in multiple small steps with pauses between,
@@ -536,7 +590,6 @@ def scroll_natural(driver, total_pixels, stop_event=None):
         chunk = min(remaining, random.randint(120, 380))
         scroll_page(driver, chunk * direction)
         remaining -= chunk
-        # Pause between scrolls — reading the content
         if remaining > 0:
             ln_sleep(random.uniform(0.4, 2.2), 0.28)
 
@@ -580,12 +633,10 @@ def human_type(element, text, wpm=None):
             pyautogui.press('space')
             ln_sleep(base_delay * (2.4 + len(word)/9.0), 0.28)
         for char in word:
-            # FIX: slightly higher typo rate, also fix by selecting+retyping
             if char.isalpha() and random.random() < 0.032:
                 wrong = random.choice(_ADJACENT.get(char.lower(), char.lower()))
                 _type_char(wrong)
                 ln_sleep(0.16, 0.28)
-                # FIX: occasionally type another wrong char before correcting
                 if random.random() < 0.20:
                     _type_char(random.choice('asdfjkl'))
                     ln_sleep(0.12, 0.25)
@@ -630,6 +681,10 @@ def select_random_text(driver):
 
 
 def occasional_ctrl_f(driver, chance=0.20, context='general'):
+    """
+    NOTE: This function is intentionally NOT called from amazon_engine.py.
+    It is kept here for other use cases only.
+    """
     if random.random() > chance:
         return
     try:
@@ -672,7 +727,6 @@ def occasional_zoom(driver, chance=0.10):
         pass
 
 
-# FIX: New helper — humans sometimes hover over images without clicking
 def hover_image_area(driver, stop_event=None):
     """Move mouse over product images area without clicking."""
     try:
@@ -687,7 +741,6 @@ def hover_image_area(driver, stop_event=None):
         pass
 
 
-# FIX: New helper — right-click context menu (real user behaviour)
 def occasional_right_click(driver, chance=0.08):
     """Occasionally right-click and immediately dismiss — very human."""
     if random.random() > chance:
@@ -706,7 +759,6 @@ def occasional_right_click(driver, chance=0.08):
         pass
 
 
-# FIX: New helper — tab switching (humans check other tabs occasionally)
 def occasional_tab_switch(driver, chance=0.06):
     """Ctrl+Tab to another tab and back — simulates checking other open tabs."""
     if random.random() > chance:
@@ -852,15 +904,12 @@ def navigate_addressbar(driver, url: str):
 
         pyautogui.moveTo(bar_x, bar_y, duration=random.uniform(0.28, 0.65))
         ln_sleep(0.12, 0.10)
-
         pyautogui.hotkey('ctrl', 'l')
         ln_sleep(0.30, 0.14)
-
         pyautogui.hotkey('ctrl', 'a')
         ln_sleep(0.10, 0.08)
 
         display = url.replace('https://', '').replace('http://', '').rstrip('/')
-
         for ch in display:
             pyautogui.typewrite(ch, interval=0)
             time.sleep(max(0.06, random.gauss(0.20, 0.06)))
@@ -923,10 +972,9 @@ def dismiss_cookie_banner(driver):
 
 def google_search(driver, query):
     """
-    FIX: Sometimes visit Google homepage first before searching,
-    like a real user who types google.com in the address bar.
+    FIX: Removed idle_mouse_drift() call — was drifting mouse to screen corners.
+    After search loads, just do a small safe pause with no mouse movement.
     """
-    # 30% of the time go to google.com homepage first
     if random.random() < 0.30:
         navigate_addressbar(driver, "google.com")
         try:
@@ -937,7 +985,6 @@ def google_search(driver, query):
         dismiss_cookie_banner(driver)
         ln_sleep(random.uniform(0.8, 2.0), 0.25)
 
-        # Type in the search box on homepage
         try:
             search_box = driver.find_element(By.NAME, "q")
             human_click(driver, search_box)
@@ -948,10 +995,8 @@ def google_search(driver, query):
             ln_sleep(2.5, 0.22)
             inject_stealth(driver)
         except Exception:
-            # Fall back to address bar search
             navigate_addressbar(driver, query)
     else:
-        # Type query directly in address bar
         navigate_addressbar(driver, query)
 
     driver.maximize_window()
@@ -964,8 +1009,8 @@ def google_search(driver, query):
         pass
 
     check_and_wait_captcha(driver)
-    idle_mouse_drift(driver, random.uniform(1.2, 3.5))
-    ln_sleep(0.8, 0.20)
+    # FIX: simple pause instead of idle_mouse_drift — no corner wandering
+    ln_sleep(random.uniform(1.0, 2.5), 0.22)
 
 
 def get_organic_results(driver, max_results=8):
@@ -988,10 +1033,9 @@ def get_organic_results(driver, max_results=8):
 
 def click_result(driver, target_url):
     """
-    FIX: Try harder to find and click the actual link element.
+    Try to find and click the actual link element.
     Falls back to driver.get() only as last resort.
     """
-    # Try multiple selector approaches
     selectors = [
         f"div#search a[href='{target_url}']",
         "div#search a[jsname][href]",
@@ -1001,7 +1045,6 @@ def click_result(driver, target_url):
             href = a.get_attribute("href") or ""
             if href == target_url or target_url in href:
                 if a.is_displayed():
-                    # FIX: scroll result into view naturally before clicking
                     if not _is_in_viewport(driver, a):
                         scroll_natural(driver, 200)
                         ln_sleep(0.4, 0.20)
@@ -1011,7 +1054,6 @@ def click_result(driver, target_url):
                     _reset_mouse(driver)
                     return True
 
-    # Last resort — direct navigation (not ideal but functional)
     driver.get(target_url)
     inject_stealth(driver)
     ln_sleep(3.0, 0.22)
